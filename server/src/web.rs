@@ -1,4 +1,5 @@
-//! Browser UI: sliders for the panel tuning and a preview of the current frame.
+//! Browser UI: tuning sliders, what to show (song, presets, uploads, GIFs)
+//! and a preview of the frame the panel is being sent.
 
 use std::io::Cursor;
 use std::net::SocketAddr;
@@ -7,10 +8,10 @@ use std::sync::Arc;
 use album_art_core::color::{Brightness, GammaExponent, Tuning, WhiteBalance};
 use album_art_core::protocol::{Frame, SIZE};
 use axum::body::Bytes;
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use image::{ImageFormat, RgbImage};
 use log::info;
@@ -18,14 +19,25 @@ use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 
-use crate::cover;
+use crate::playback::{Animation, Repeat, Source};
+use crate::presets::Presets;
+use crate::scale;
 
 const PAGE: &str = include_str!("web.html");
+/// Long GIFs such as music videos run to tens of MiB.
+const MAX_UPLOAD: usize = 256 * 1024 * 1024;
 
 #[derive(Clone)]
 struct AppState {
     tuning: Arc<watch::Sender<Tuning>>,
-    frames: Arc<watch::Sender<Arc<Frame>>>,
+    source: Arc<watch::Sender<Source>>,
+    output: watch::Receiver<Arc<Frame>>,
+    presets: Arc<Presets>,
+}
+
+#[derive(Deserialize)]
+struct AnimationQuery {
+    repeat: Repeat,
 }
 
 /// Wire form of [`Tuning`] for the page; validated on the way in.
@@ -68,14 +80,28 @@ impl TryFrom<TuningJson> for Tuning {
 pub async fn serve(
     address: SocketAddr,
     tuning: Arc<watch::Sender<Tuning>>,
-    frames: Arc<watch::Sender<Arc<Frame>>>,
+    source: Arc<watch::Sender<Source>>,
+    output: watch::Receiver<Arc<Frame>>,
+    presets: Arc<Presets>,
 ) -> std::io::Result<()> {
     let app = Router::new()
         .route("/", get(|| async { Html(PAGE) }))
         .route("/tuning", get(get_tuning).put(put_tuning))
         .route("/frame.png", get(frame_png))
-        .route("/frame", axum::routing::put(put_frame))
-        .with_state(AppState { tuning, frames });
+        .route("/presets", get(list_presets))
+        .route("/presets/{name}", get(preset_image))
+        .route("/show/song", post(show_song))
+        .route("/show/clear", post(show_clear))
+        .route("/show/preset/{name}", post(show_preset))
+        .route("/show/image", put(show_image))
+        .route("/show/animation", put(show_animation))
+        .layer(DefaultBodyLimit::max(MAX_UPLOAD))
+        .with_state(AppState {
+            tuning,
+            source,
+            output,
+            presets,
+        });
     let listener = TcpListener::bind(address).await?;
     info!("Web: listening on http://{address}");
     axum::serve(listener, app).await
@@ -95,20 +121,81 @@ async fn put_tuning(State(state): State<AppState>, Json(json): Json<TuningJson>)
     }
 }
 
-/// Shows any PNG or JPEG until the next track change replaces it.
-async fn put_frame(State(state): State<AppState>, image: Bytes) -> Response {
-    match cover::to_frame(&image) {
+async fn frame_png(State(state): State<AppState>) -> Response {
+    let png = encode_png(&state.output.borrow());
+    ([(header::CONTENT_TYPE, "image/png")], png).into_response()
+}
+
+async fn list_presets(State(state): State<AppState>) -> Json<Vec<String>> {
+    Json(state.presets.keys().cloned().collect())
+}
+
+async fn preset_image(State(state): State<AppState>, Path(name): Path<String>) -> Response {
+    let Some(preset) = state.presets.get(&name) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let format = image::guess_format(&preset.original).expect("presets were decoded at startup");
+    (
+        [(header::CONTENT_TYPE, format.to_mime_type())],
+        preset.original.clone(),
+    )
+        .into_response()
+}
+
+async fn show_song(State(state): State<AppState>) -> StatusCode {
+    state.source.send_replace(Source::Song);
+    StatusCode::NO_CONTENT
+}
+
+async fn show_clear(State(state): State<AppState>) -> StatusCode {
+    state
+        .source
+        .send_replace(Source::Still(Arc::new(Frame::black())));
+    StatusCode::NO_CONTENT
+}
+
+async fn show_preset(State(state): State<AppState>, Path(name): Path<String>) -> StatusCode {
+    let Some(preset) = state.presets.get(&name) else {
+        return StatusCode::NOT_FOUND;
+    };
+    state
+        .source
+        .send_replace(Source::Still(Arc::clone(&preset.frame)));
+    StatusCode::NO_CONTENT
+}
+
+/// Shows any still image until something else is selected.
+async fn show_image(State(state): State<AppState>, image: Bytes) -> Response {
+    let decoded = tokio::task::spawn_blocking(move || scale::to_frame(&image))
+        .await
+        .expect("decoding does not panic");
+    match decoded {
         Ok(frame) => {
-            state.frames.send_replace(Arc::new(frame));
+            state.source.send_replace(Source::Still(Arc::new(frame)));
             StatusCode::NO_CONTENT.into_response()
         }
         Err(e) => (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()).into_response(),
     }
 }
 
-async fn frame_png(State(state): State<AppState>) -> Response {
-    let png = encode_png(&state.frames.borrow());
-    ([(header::CONTENT_TYPE, "image/png")], png).into_response()
+async fn show_animation(
+    State(state): State<AppState>,
+    Query(query): Query<AnimationQuery>,
+    gif: Bytes,
+) -> Response {
+    let decoded = tokio::task::spawn_blocking(move || scale::to_animation(&gif))
+        .await
+        .expect("decoding does not panic");
+    let frames = match decoded {
+        Ok(frames) => frames,
+        Err(e) => return (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()).into_response(),
+    };
+    let Some(animation) = Animation::new(frames, query.repeat) else {
+        return (StatusCode::UNPROCESSABLE_ENTITY, "the GIF has no frames").into_response();
+    };
+    info!("Web: playing a {}-frame animation", animation.len());
+    state.source.send_replace(Source::Animation(animation));
+    StatusCode::NO_CONTENT.into_response()
 }
 
 fn encode_png(frame: &Frame) -> Vec<u8> {

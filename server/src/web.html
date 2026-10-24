@@ -6,35 +6,90 @@
 <title>Panel</title>
 <style>
   body { font-family: system-ui, sans-serif; background: #111; color: #ddd; max-width: 28rem; margin: 2rem auto; padding: 0 1rem; }
-  img { width: 100%; image-rendering: pixelated; background: #000; }
-  label { display: grid; grid-template-columns: 7rem 1fr 3.5rem; gap: .75rem; align-items: center; margin: .9rem 0; }
+  h2 { font-size: .8rem; text-transform: uppercase; letter-spacing: .08em; color: #888; margin: 1.6rem 0 .6rem; }
+  #frame { width: 100%; image-rendering: pixelated; background: #000; }
+  button { background: #2a2a2a; color: #ddd; border: 1px solid #444; border-radius: .4rem; padding: .5rem 1rem; font: inherit; cursor: pointer; }
+  button:hover { background: #333; }
+  .row { display: flex; gap: .5rem; flex-wrap: wrap; align-items: center; }
+  #presets img { width: 4rem; height: 4rem; image-rendering: pixelated; background: #000; border: 1px solid #444; border-radius: .4rem; cursor: pointer; }
+  #presets img:hover { border-color: #aaa; }
+  label.slider { display: grid; grid-template-columns: 7rem 1fr 3.5rem; gap: .75rem; align-items: center; margin: .9rem 0; }
   output { text-align: right; font-variant-numeric: tabular-nums; }
-  #error { color: #f66; min-height: 1.2em; }
+  #status { color: #f66; min-height: 1.2em; margin-top: 1rem; }
 </style>
 </head>
 <body>
-<img id="frame" src="/frame.png" alt="Current frame">
-<label>Brightness <input type="range" id="brightness" min="0" max="100"><output for="brightness"></output></label>
-<label>Gamma <input type="range" id="gamma_hundredths" min="100" max="400" step="5"><output for="gamma_hundredths"></output></label>
-<label>Red <input type="range" id="red" min="0" max="100"><output for="red"></output></label>
-<label>Green <input type="range" id="green" min="0" max="100"><output for="green"></output></label>
-<label>Blue <input type="range" id="blue" min="0" max="100"><output for="blue"></output></label>
-<div id="error"></div>
+<img id="frame" src="/frame.png" alt="What the panel is showing">
+
+<h2>Show</h2>
+<div class="row">
+  <button id="song">Song</button>
+  <button id="clear">Clear</button>
+</div>
+
+<h2>Presets</h2>
+<div class="row" id="presets"></div>
+
+<h2>Upload</h2>
+<div class="row">
+  <input type="file" id="file" accept="image/*">
+  <label><input type="checkbox" id="repeat" checked> repeat GIFs</label>
+  <button id="upload">Show</button>
+</div>
+
+<h2>Tuning</h2>
+<label class="slider">Brightness <input type="range" id="brightness" min="0" max="100"><output></output></label>
+<label class="slider">Gamma <input type="range" id="gamma_hundredths" min="100" max="400" step="5"><output></output></label>
+<label class="slider">Red <input type="range" id="red" min="0" max="100"><output></output></label>
+<label class="slider">Green <input type="range" id="green" min="0" max="100"><output></output></label>
+<label class="slider">Blue <input type="range" id="blue" min="0" max="100"><output></output></label>
+
+<div id="status"></div>
 <script>
+const status = document.getElementById("status");
+const request = async (method, url, body) => {
+  status.textContent = "";
+  const response = await fetch(url, { method, body });
+  if (!response.ok) status.textContent = await response.text() || response.statusText;
+};
+
+document.getElementById("song").onclick = () => request("POST", "/show/song");
+document.getElementById("clear").onclick = () => request("POST", "/show/clear");
+
+(async () => {
+  const names = await (await fetch("/presets")).json();
+  const container = document.getElementById("presets");
+  for (const name of names) {
+    const image = document.createElement("img");
+    image.src = "/presets/" + encodeURIComponent(name);
+    image.alt = image.title = name;
+    image.onclick = () => request("POST", "/show/preset/" + encodeURIComponent(name));
+    container.append(image);
+  }
+})();
+
+document.getElementById("upload").onclick = () => {
+  const file = document.getElementById("file").files[0];
+  if (!file) return;
+  if (file.type === "image/gif") {
+    const repeat = document.getElementById("repeat").checked ? "forever" : "once";
+    request("PUT", "/show/animation?repeat=" + repeat, file);
+  } else {
+    request("PUT", "/show/image", file);
+  }
+};
+
 const fields = ["brightness", "gamma_hundredths", "red", "green", "blue"];
 const show = (id) => {
   const input = document.getElementById(id);
   const value = Number(input.value);
   input.nextElementSibling.value = id === "gamma_hundredths" ? (value / 100).toFixed(2) : value + "%";
 };
-const send = async () => {
+const sendTuning = () => {
   const tuning = Object.fromEntries(fields.map((id) => [id, Number(document.getElementById(id).value)]));
-  const response = await fetch("/tuning", {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(tuning),
-  });
-  document.getElementById("error").textContent = response.ok ? "" : await response.text();
+  status.textContent = "";
+  fetch("/tuning", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(tuning) })
+    .then(async (response) => { if (!response.ok) status.textContent = await response.text(); });
 };
 (async () => {
   const tuning = await (await fetch("/tuning")).json();
@@ -42,10 +97,11 @@ const send = async () => {
     const input = document.getElementById(id);
     input.value = tuning[id];
     show(id);
-    input.addEventListener("input", () => { show(id); send(); });
+    input.addEventListener("input", () => { show(id); sendTuning(); });
   }
 })();
-setInterval(() => { document.getElementById("frame").src = "/frame.png?" + Date.now(); }, 2000);
+
+setInterval(() => { document.getElementById("frame").src = "/frame.png?" + Date.now(); }, 500);
 </script>
 </body>
 </html>

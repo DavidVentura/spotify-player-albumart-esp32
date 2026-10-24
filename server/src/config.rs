@@ -1,5 +1,6 @@
 use std::env;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 
 use crate::spotify::{ClientCredentials, RefreshToken};
 
@@ -9,6 +10,7 @@ pub struct Config {
     pub refresh_token: RefreshToken,
     pub device_listen: SocketAddr,
     pub web_listen: SocketAddr,
+    pub presets_dir: PathBuf,
 }
 
 #[derive(Debug)]
@@ -43,6 +45,9 @@ impl Config {
             refresh_token: RefreshToken::new(required("SPOTIFY_REFRESH_TOKEN")?),
             device_listen: address("DEVICE_LISTEN", "0.0.0.0:7878")?,
             web_listen: address("WEB_LISTEN", "0.0.0.0:8080")?,
+            presets_dir: env::var_os("PRESETS_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/presets"))),
         })
     }
 }
