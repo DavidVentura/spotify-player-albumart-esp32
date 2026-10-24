@@ -1,0 +1,10 @@
+/.devcontainer
+/Cargo.lock
+/bootloader.bin
+/bootloader-c6.bin
+/*.code-workspace
+/espflash.toml
+/partitions.csv
+/rust-toolchain.toml
+/target
+/.cursorrules

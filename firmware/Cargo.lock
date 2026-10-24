@@ -842,8 +842,6 @@ dependencies = [
 [[package]]
 name = "esp-hub75"
 version = "0.17.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "99d269a92ce698e4187eae92aa29fd0f8742ab2dc301c28657c419958c04aa6b"
 dependencies = [
  "esp-hal",
  "esp-metadata-generated",

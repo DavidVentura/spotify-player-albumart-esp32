@@ -22,7 +22,7 @@ esp-alloc = { version = "0.11", features = ["esp32"] }
 esp-backtrace = { version = "0.20", features = ["esp32", "panic-handler", "println"] }
 esp-bootloader-esp-idf = { version = "0.6", features = ["esp32", "log-04"] }
 esp-hal = { version = "~1.2.2", features = ["esp32", "unstable", "log-04"] }
-esp-hub75 = { version = "0.17", features = ["esp32", "circular-dma", "iram", "log"] }
+esp-hub75 = { version = "0.17", features = ["esp32", "ring-swap", "iram", "log"] }
 esp-metadata-generated = { version = "0.5", features = ["esp32"] }
 esp-println = { version = "0.18", features = ["esp32", "log-04"] }
 esp-radio = { version = "=1.0.0-beta.1", features = ["esp32", "wifi", "unstable", "log-04"] }
@@ -30,9 +30,12 @@ esp-rtos = { version = "0.4", features = ["esp32", "embassy", "esp-radio", "log-
 log = "0.4"
 static_cell = "2"
 
-# Adds `set_brightness` (output-enable duty cycle) to the bitplane framebuffer
 [patch.crates-io]
+# Adds `set_brightness` (output-enable duty cycle) to the bitplane framebuffer
 hub75-framebuffer = { path = "../vendor/hub75-framebuffer" }
+# Adds `ring-swap`: swaps buffers without stopping the DMA, because the
+# circular mode's stop and restart corrupts the first rows after every swap
+esp-hub75 = { path = "../vendor/esp-hub75" }
 
 [profile.dev]
 # Rust debug builds are too slow for the radio and TLS stacks
