@@ -1,0 +1,16 @@
+[build]
+target = "xtensa-esp32-none-elf"
+
+[target.xtensa-esp32-none-elf]
+runner = "espflash flash --monitor"
+rustflags = ["-C", "link-arg=-nostartfiles", "-C", "link-arg=-Wl,-Tlinkall.x"]
+
+[env]
+ESP_LOG = "info"
+# The board is a v1.0 chip; esp-hal defaults to requiring v3.0 because it lacks
+# ESP-IDF's workarounds for older silicon, which matter for dual-core and PSRAM
+# use. This firmware runs on one core without PSRAM.
+ESP_HAL_CONFIG_MIN_CHIP_REVISION = "100"
+
+[unstable]
+build-std = ["core", "alloc"]

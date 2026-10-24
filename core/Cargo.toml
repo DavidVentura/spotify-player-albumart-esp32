@@ -1,0 +1,14 @@
+[package]
+name = "album-art-core"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+base64 = { version = "0.22", default-features = false, features = ["alloc"] }
+httparse = { version = "1.10", default-features = false }
+libm = "0.2"
+serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
+serde_json = { version = "1", default-features = false, features = ["alloc"] }
+zune-core = { version = "0.5", default-features = false }
+zune-jpeg = { version = "0.5", default-features = false }

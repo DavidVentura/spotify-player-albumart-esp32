@@ -1,0 +1,55 @@
+[package]
+name = "spotify-album-art"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "spotify-album-art"
+test = false
+bench = false
+
+[dependencies]
+album-art-core = { path = "../core" }
+
+embassy-executor = "0.10"
+embassy-futures = "0.1"
+embassy-net = { version = "0.9", features = ["proto-ipv4", "medium-ethernet", "dhcpv4", "tcp", "udp", "dns"] }
+embassy-sync = "0.8"
+embassy-time = "0.5"
+embedded-graphics = "0.8"
+esp-alloc = { version = "0.11", features = ["esp32"] }
+esp-backtrace = { version = "0.20", features = ["esp32", "panic-handler", "println"] }
+esp-bootloader-esp-idf = { version = "0.6", features = ["esp32", "log-04"] }
+esp-hal = { version = "~1.2.2", features = ["esp32", "unstable", "log-04"] }
+esp-hub75 = { version = "0.17", features = ["esp32", "circular-dma", "iram", "log"] }
+esp-metadata-generated = { version = "0.5", features = ["esp32"] }
+esp-println = { version = "0.18", features = ["esp32", "log-04"] }
+esp-radio = { version = "=1.0.0-beta.1", features = ["esp32", "wifi", "unstable", "log-04"] }
+esp-rtos = { version = "0.4", features = ["esp32", "embassy", "esp-radio", "log-04"] }
+log = "0.4"
+mbedtls-rs = { version = "0.3", features = ["esp32", "embassy-time", "hook-wall-clock", "log", "use-gcc"] }
+sntpc = "0.11"
+sntpc-net-embassy = { version = "0.11", features = ["log"] }
+static_cell = "2"
+tinyrlibc = { version = "0.5", default-features = false, features = ["memchr"] }
+
+# Adds `set_brightness` (output-enable duty cycle) to the bitplane framebuffer
+[patch.crates-io]
+hub75-framebuffer = { path = "../vendor/hub75-framebuffer" }
+
+[profile.dev]
+# Rust debug builds are too slow for the radio and TLS stacks
+opt-level = "s"
+
+[profile.release]
+debug = true
+lto = "fat"
+opt-level = "s"
+codegen-units = 1
+
+# The RSA/AES accelerator drivers are much slower when size-optimised
+[profile.release.package.esp-hal]
+opt-level = 3
+[profile.dev.package.esp-hal]
+opt-level = 3
