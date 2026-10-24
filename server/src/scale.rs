@@ -6,8 +6,7 @@ use std::time::Duration;
 use album_art_core::color::Rgb;
 use album_art_core::protocol::{Frame, SIZE};
 use image::codecs::gif::GifDecoder;
-use image::imageops::FilterType;
-use image::{AnimationDecoder, DynamicImage, ImageError, RgbImage};
+use image::{AnimationDecoder, DynamicImage, ImageError};
 
 /// GIFs often declare a zero delay; browsers show those at 10 fps, and so do we.
 const MIN_FRAME_DELAY: Duration = Duration::from_millis(20);
@@ -37,25 +36,87 @@ pub fn to_animation(gif: &[u8]) -> Result<Vec<(Frame, Duration)>, ImageError> {
         .collect()
 }
 
-/// Flattens transparency onto black (the panel's "off") at full resolution,
-/// then averages every source pixel into the 64x64 result so noise in the
-/// original does not survive.
+/// Crops the centre square and averages every source pixel it covers into
+/// the 64x64 result, weighted by how much of each panel pixel it covers.
+/// Unlike windowed-sinc filters, an average cannot overshoot next to hard
+/// edges, which the panel's coarse dark levels would show as stray specks.
+/// Averaging and the flattening of transparency onto black (the panel's
+/// "off") happen in linear light, where mixing light is physically additive.
 fn fit(image: DynamicImage) -> Frame {
     let rgba = image.to_rgba8();
-    let flattened = RgbImage::from_fn(rgba.width(), rgba.height(), |x, y| {
-        let [r, g, b, a] = rgba.get_pixel(x, y).0;
-        let over_black = |channel: u8| ((u16::from(channel) * u16::from(a) + 127) / 255) as u8;
-        [over_black(r), over_black(g), over_black(b)].into()
-    });
-    let scaled = DynamicImage::ImageRgb8(flattened)
-        .resize_to_fill(SIZE as u32, SIZE as u32, FilterType::Lanczos3)
-        .to_rgb8();
+    let (width, height) = rgba.dimensions();
+    let side = f64::from(width.min(height));
+    let columns = coverage(f64::from(width - width.min(height)) / 2.0, side);
+    let rows = coverage(f64::from(height - width.min(height)) / 2.0, side);
+    let to_linear: [f32; 256] = core::array::from_fn(|value| srgb_to_linear(value as u8));
+
+    // Separable: average each source row into panel columns first, so every
+    // source pixel is read once
+    let mut row_averages = vec![[[0f32; 3]; SIZE]; height as usize];
+    for (y, averages) in row_averages.iter_mut().enumerate() {
+        for (average, column) in averages.iter_mut().zip(&columns) {
+            for &(x, weight) in column {
+                let [r, g, b, a] = rgba.get_pixel(x, y as u32).0;
+                let opacity = f32::from(a) / 255.0;
+                for (sum, channel) in average.iter_mut().zip([r, g, b]) {
+                    *sum += to_linear[usize::from(channel)] * opacity * weight;
+                }
+            }
+        }
+    }
+
     let mut frame = Frame::black();
-    for (x, y, pixel) in scaled.enumerate_pixels() {
-        let [r, g, b] = pixel.0;
-        frame.pixels[y as usize][x as usize] = Rgb { r, g, b };
+    for (frame_row, row) in frame.pixels.iter_mut().zip(&rows) {
+        for (x, pixel) in frame_row.iter_mut().enumerate() {
+            let mut linear = [0f32; 3];
+            for &(y, weight) in row {
+                for (sum, value) in linear.iter_mut().zip(row_averages[y as usize][x]) {
+                    *sum += value * weight;
+                }
+            }
+            let [r, g, b] = linear.map(linear_to_srgb);
+            *pixel = Rgb { r, g, b };
+        }
     }
     frame
+}
+
+/// For each panel pixel along one axis, the source pixels it covers within
+/// `[start, start + length)` and the fraction of the panel pixel each one
+/// covers; the fractions of every panel pixel add up to one.
+fn coverage(start: f64, length: f64) -> Vec<Vec<(u32, f32)>> {
+    let step = length / SIZE as f64;
+    (0..SIZE)
+        .map(|index| {
+            let from = start + index as f64 * step;
+            let to = from + step;
+            (from.floor() as u32..to.ceil() as u32)
+                .map(|source| {
+                    let overlap = to.min(f64::from(source + 1)) - from.max(f64::from(source));
+                    (source, (overlap / step) as f32)
+                })
+                .filter(|&(_, weight)| weight > 0.0)
+                .collect()
+        })
+        .collect()
+}
+
+fn srgb_to_linear(value: u8) -> f32 {
+    let encoded = f32::from(value) / 255.0;
+    if encoded <= 0.04045 {
+        encoded / 12.92
+    } else {
+        ((encoded + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+fn linear_to_srgb(linear: f32) -> u8 {
+    let encoded = if linear <= 0.003_130_8 {
+        linear * 12.92
+    } else {
+        1.055 * linear.powf(1.0 / 2.4) - 0.055
+    };
+    (encoded * 255.0).round().clamp(0.0, 255.0) as u8
 }
 
 #[cfg(test)]
@@ -63,7 +124,7 @@ mod tests {
     use super::*;
     use image::codecs::gif::{GifEncoder, Repeat};
     use image::codecs::jpeg::JpegEncoder;
-    use image::{Delay, ImageEncoder, RgbaImage};
+    use image::{Delay, ImageEncoder, RgbImage, RgbaImage};
 
     const RED: [u8; 3] = [255, 0, 0];
     const BLUE: [u8; 3] = [0, 0, 255];
@@ -125,8 +186,8 @@ mod tests {
 
     #[test]
     fn crops_non_square_covers_to_the_centre() {
-        // The centre crop is x 150..750; blue sits clear of it so the
-        // resampling filter at the crop edge only ever sees red
+        // The centre crop is x 150..750; blue sits clear of it so JPEG
+        // ringing at the colour edge stays outside the crop
         let cover = RgbImage::from_fn(900, 600, |x, _| {
             if (100..800).contains(&x) {
                 RED.into()
@@ -137,6 +198,99 @@ mod tests {
         let frame = to_frame(&jpeg(&cover)).unwrap();
         assert_close(frame.pixels[32][0], RED);
         assert_close(frame.pixels[32][63], RED);
+    }
+
+    fn png(image: &RgbImage) -> Vec<u8> {
+        let mut encoded = Vec::new();
+        image
+            .write_to(&mut Cursor::new(&mut encoded), image::ImageFormat::Png)
+            .unwrap();
+        encoded
+    }
+
+    #[test]
+    fn hard_edges_do_not_ring_into_black() {
+        let cover = RgbImage::from_fn(640, 640, |x, _| {
+            if x < 320 {
+                [255, 255, 255].into()
+            } else {
+                [0, 0, 0].into()
+            }
+        });
+        let frame = to_frame(&png(&cover)).unwrap();
+        for row in frame.pixels.iter() {
+            assert!(row[..32].iter().all(|&p| p
+                == Rgb {
+                    r: 255,
+                    g: 255,
+                    b: 255
+                }));
+            assert!(row[32..].iter().all(|&p| p == Rgb { r: 0, g: 0, b: 0 }));
+        }
+    }
+
+    #[test]
+    fn averages_in_linear_light() {
+        // Half the light of white is sRGB 188, not the naive 128
+        let checkerboard = RgbImage::from_fn(640, 640, |x, y| {
+            if (x + y) % 2 == 0 {
+                [255, 255, 255].into()
+            } else {
+                [0, 0, 0].into()
+            }
+        });
+        let frame = to_frame(&png(&checkerboard)).unwrap();
+        assert_eq!(
+            frame.pixels[17][40],
+            Rgb {
+                r: 188,
+                g: 188,
+                b: 188
+            }
+        );
+    }
+
+    #[test]
+    fn uneven_scales_keep_flat_colour_exact() {
+        let flat = RgbImage::from_pixel(97, 61, [37, 140, 222].into());
+        let frame = to_frame(&png(&flat)).unwrap();
+        for row in frame.pixels.iter() {
+            assert!(row.iter().all(|&p| p
+                == Rgb {
+                    r: 37,
+                    g: 140,
+                    b: 222
+                }));
+        }
+    }
+
+    #[test]
+    fn small_images_scale_up_into_blocks() {
+        let small = RgbImage::from_fn(8, 8, |x, y| {
+            if (x + y) % 2 == 0 {
+                RED.into()
+            } else {
+                BLUE.into()
+            }
+        });
+        let frame = to_frame(&png(&small)).unwrap();
+        let red = Rgb { r: 255, g: 0, b: 0 };
+        let blue = Rgb { r: 0, g: 0, b: 255 };
+        assert_eq!(frame.pixels[0][0], red);
+        assert_eq!(frame.pixels[7][7], red);
+        assert_eq!(frame.pixels[0][8], blue);
+        assert_eq!(frame.pixels[63][56], red);
+        assert_eq!(frame.pixels[63][48], blue);
+    }
+
+    #[test]
+    fn coverage_weights_sum_to_one() {
+        for (start, length) in [(0.0, 640.0), (19.5, 61.0), (0.0, 8.0), (3.0, 100.0)] {
+            for weights in coverage(start, length) {
+                let total: f32 = weights.iter().map(|&(_, weight)| weight).sum();
+                assert!((total - 1.0).abs() < 1e-4, "{start} {length}: {total}");
+            }
+        }
     }
 
     #[test]
