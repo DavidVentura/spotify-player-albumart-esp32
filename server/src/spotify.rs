@@ -102,8 +102,14 @@ struct CurrentlyPlaying {
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 enum Item {
-    Track { album: Album, duration_ms: u64 },
-    Episode { images: Vec<Image>, duration_ms: u64 },
+    Track {
+        album: Album,
+        duration_ms: u64,
+    },
+    Episode {
+        images: Vec<Image>,
+        duration_ms: u64,
+    },
 }
 
 #[derive(Deserialize)]
