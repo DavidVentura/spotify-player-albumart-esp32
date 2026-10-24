@@ -11,8 +11,8 @@ use static_cell::StaticCell;
 
 use crate::config::{WIFI_PASSWORD, WIFI_SSID};
 
-/// DNS, the HTTPS connection, the SNTP query and the control server.
-const SOCKETS: usize = 4;
+/// DHCP and the server connection.
+const SOCKETS: usize = 2;
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 /// In units of 0.25 dBm; ESP-IDF's default of 20 dBm.
 const MAX_TX_POWER: i8 = 80;

@@ -14,7 +14,7 @@ album-art-core = { path = "../core" }
 
 embassy-executor = "0.10"
 embassy-futures = "0.1"
-embassy-net = { version = "0.9", features = ["proto-ipv4", "medium-ethernet", "dhcpv4", "tcp", "udp", "dns"] }
+embassy-net = { version = "0.9", features = ["proto-ipv4", "medium-ethernet", "dhcpv4", "tcp"] }
 embassy-sync = "0.8"
 embassy-time = "0.5"
 embedded-graphics = "0.8"
@@ -28,11 +28,7 @@ esp-println = { version = "0.18", features = ["esp32", "log-04"] }
 esp-radio = { version = "=1.0.0-beta.1", features = ["esp32", "wifi", "unstable", "log-04"] }
 esp-rtos = { version = "0.4", features = ["esp32", "embassy", "esp-radio", "log-04"] }
 log = "0.4"
-mbedtls-rs = { version = "0.3", features = ["esp32", "embassy-time", "hook-wall-clock", "log", "use-gcc"] }
-sntpc = "0.11"
-sntpc-net-embassy = { version = "0.11", features = ["log"] }
 static_cell = "2"
-tinyrlibc = { version = "0.5", default-features = false, features = ["memchr"] }
 
 # Adds `set_brightness` (output-enable duty cycle) to the bitplane framebuffer
 [patch.crates-io]

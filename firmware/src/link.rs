@@ -1,0 +1,66 @@
+use core::net::SocketAddrV4;
+
+use album_art_core::protocol::{Message, MessageReader, ProtocolError};
+use embassy_net::Stack;
+use embassy_net::tcp::{self, TcpSocket};
+use embassy_time::{Duration, Timer};
+use log::{info, warn};
+
+use crate::display;
+
+const RECONNECT_DELAY: Duration = Duration::from_secs(2);
+/// A full frame is 12 KiB; a large window keeps it to a few round trips.
+const RX_BUFFER: usize = 8 * 1024;
+const READ_CHUNK: usize = 1024;
+/// Without traffic from the server, keepalives notice a server that vanished
+/// without closing the connection.
+const KEEP_ALIVE: Duration = Duration::from_secs(10);
+const TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Debug)]
+#[expect(dead_code, reason = "fields are only read through Debug when logged")]
+enum LinkError {
+    Connect(tcp::ConnectError),
+    Read(tcp::Error),
+    Closed,
+    Protocol(ProtocolError),
+}
+
+/// Keeps a connection to the server open and hands everything it sends to the
+/// display. The last frame stays up while reconnecting.
+#[embassy_executor::task]
+pub async fn run(stack: Stack<'static>, server: SocketAddrV4) {
+    let mut rx_buffer = alloc::vec![0; RX_BUFFER];
+    let mut tx_buffer = [0; 64];
+    loop {
+        let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
+        socket.set_keep_alive(Some(KEEP_ALIVE));
+        socket.set_timeout(Some(TIMEOUT));
+        match receive(&mut socket, server).await {
+            Ok(()) => {}
+            Err(e) => warn!("Link: {e:?}"),
+        }
+        socket.abort();
+        Timer::after(RECONNECT_DELAY).await;
+    }
+}
+
+async fn receive(socket: &mut TcpSocket<'_>, server: SocketAddrV4) -> Result<(), LinkError> {
+    socket.connect(server).await.map_err(LinkError::Connect)?;
+    info!("Link: connected to {server}");
+    let mut reader = MessageReader::default();
+    let mut chunk = [0; READ_CHUNK];
+    loop {
+        let read = socket.read(&mut chunk).await.map_err(LinkError::Read)?;
+        if read == 0 {
+            return Err(LinkError::Closed);
+        }
+        let messages = reader.feed(&chunk[..read]).map_err(LinkError::Protocol)?;
+        for message in messages {
+            match message {
+                Message::Frame(frame) => display::show(frame),
+                Message::Tune(tuning) => display::tune(tuning),
+            }
+        }
+    }
+}

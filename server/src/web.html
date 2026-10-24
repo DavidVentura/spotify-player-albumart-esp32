@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Panel</title>
+<style>
+  body { font-family: system-ui, sans-serif; background: #111; color: #ddd; max-width: 28rem; margin: 2rem auto; padding: 0 1rem; }
+  img { width: 100%; image-rendering: pixelated; background: #000; }
+  label { display: grid; grid-template-columns: 7rem 1fr 3.5rem; gap: .75rem; align-items: center; margin: .9rem 0; }
+  output { text-align: right; font-variant-numeric: tabular-nums; }
+  #error { color: #f66; min-height: 1.2em; }
+</style>
+</head>
+<body>
+<img id="frame" src="/frame.png" alt="Current frame">
+<label>Brightness <input type="range" id="brightness" min="0" max="100"><output for="brightness"></output></label>
+<label>Gamma <input type="range" id="gamma_hundredths" min="100" max="400" step="5"><output for="gamma_hundredths"></output></label>
+<label>Red <input type="range" id="red" min="0" max="100"><output for="red"></output></label>
+<label>Green <input type="range" id="green" min="0" max="100"><output for="green"></output></label>
+<label>Blue <input type="range" id="blue" min="0" max="100"><output for="blue"></output></label>
+<div id="error"></div>
+<script>
+const fields = ["brightness", "gamma_hundredths", "red", "green", "blue"];
+const show = (id) => {
+  const input = document.getElementById(id);
+  const value = Number(input.value);
+  input.nextElementSibling.value = id === "gamma_hundredths" ? (value / 100).toFixed(2) : value + "%";
+};
+const send = async () => {
+  const tuning = Object.fromEntries(fields.map((id) => [id, Number(document.getElementById(id).value)]));
+  const response = await fetch("/tuning", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(tuning),
+  });
+  document.getElementById("error").textContent = response.ok ? "" : await response.text();
+};
+(async () => {
+  const tuning = await (await fetch("/tuning")).json();
+  for (const id of fields) {
+    const input = document.getElementById(id);
+    input.value = tuning[id];
+    show(id);
+    input.addEventListener("input", () => { show(id); send(); });
+  }
+})();
+setInterval(() => { document.getElementById("frame").src = "/frame.png?" + Date.now(); }, 2000);
+</script>
+</body>
+</html>

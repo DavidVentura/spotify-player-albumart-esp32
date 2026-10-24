@@ -1,10 +1,8 @@
-use album_art_core::color::ColorCorrection;
-use album_art_core::control::{Command, Tuning};
-use album_art_core::thumbnail::{SIZE, Thumbnail};
+use album_art_core::color::{ColorCorrection, Tuning};
+use album_art_core::protocol::{Frame, SIZE};
 use embassy_executor::Spawner;
 use embassy_futures::select::{Either, select};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-use embassy_sync::channel::Channel;
 use embassy_sync::signal::Signal;
 use embedded_graphics::geometry::Point;
 use esp_hal::peripherals::{DMA_I2S0, I2S0};
@@ -26,21 +24,15 @@ const REFRESH_HZ: u32 = esp_hub75::refresh_hz::<FrameBuffer>(PIXEL_CLOCK);
 // Below this, the panel visibly flickers in peripheral vision
 const _: () = assert!(REFRESH_HZ >= 120);
 
-pub enum Screen {
-    Blank,
-    Cover(Thumbnail),
+static FRAME: Signal<CriticalSectionRawMutex, Frame> = Signal::new();
+static TUNING: Signal<CriticalSectionRawMutex, Tuning> = Signal::new();
+
+pub fn show(frame: Frame) {
+    FRAME.signal(frame);
 }
 
-static SCREEN: Signal<CriticalSectionRawMutex, Screen> = Signal::new();
-/// A queue rather than a signal, so commands sent back to back are all applied.
-static COMMANDS: Channel<CriticalSectionRawMutex, Command, 4> = Channel::new();
-
-pub fn show(screen: Screen) {
-    SCREEN.signal(screen);
-}
-
-pub async fn adjust(command: Command) {
-    COMMANDS.send(command).await;
+pub fn tune(tuning: Tuning) {
+    TUNING.signal(tuning);
 }
 
 pub fn start(
@@ -76,15 +68,16 @@ async fn display_task(
     hub75: Hub75<esp_hal::Async, FrameBuffer>,
     mut back: &'static mut FrameBuffer,
 ) {
-    let mut screen = Screen::Blank;
+    let mut frame = Frame::black();
     let mut tuning = Tuning::DEFAULT;
-    let mut correction = ColorCorrection::new(tuning.gamma, tuning.white_balance);
+    let mut correction = ColorCorrection::new(tuning.gamma, tuning.white_balance, PLANES as u32);
     loop {
-        match select(SCREEN.wait(), COMMANDS.receive()).await {
-            Either::First(next) => screen = next,
-            Either::Second(command) => {
-                tuning = tuning.with(command);
-                correction = ColorCorrection::new(tuning.gamma, tuning.white_balance);
+        match select(FRAME.wait(), TUNING.wait()).await {
+            Either::First(next) => frame = next,
+            Either::Second(next) => {
+                tuning = next;
+                correction =
+                    ColorCorrection::new(tuning.gamma, tuning.white_balance, PLANES as u32);
                 let (red, green, blue) = tuning.white_balance.percentages();
                 info!(
                     "Display: brightness {}%, gamma {}, white balance {red}/{green}/{blue}",
@@ -94,15 +87,13 @@ async fn display_task(
             }
         }
         back.erase();
-        if let Screen::Cover(thumbnail) = &screen {
-            for (y, row) in thumbnail.pixels.iter().enumerate() {
-                for (x, &pixel) in row.iter().enumerate() {
-                    let pixel = correction.apply(pixel);
-                    back.set_pixel(
-                        Point::new(x as i32, y as i32),
-                        Color::new(pixel.r, pixel.g, pixel.b),
-                    );
-                }
+        for (y, row) in frame.pixels.iter().enumerate() {
+            for (x, &pixel) in row.iter().enumerate() {
+                let pixel = correction.apply(pixel);
+                back.set_pixel(
+                    Point::new(x as i32, y as i32),
+                    Color::new(pixel.r, pixel.g, pixel.b),
+                );
             }
         }
         back.set_brightness(tuning.brightness.duty());

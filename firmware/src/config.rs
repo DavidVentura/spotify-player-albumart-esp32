@@ -1,6 +1,5 @@
 pub const WIFI_SSID: &str = env!("WIFI_SSID");
 pub const WIFI_PASSWORD: &str = env!("WIFI_PASSWORD");
 
-pub const SPOTIFY_CLIENT_ID: &str = env!("SPOTIFY_CLIENT_ID");
-pub const SPOTIFY_CLIENT_SECRET: &str = env!("SPOTIFY_CLIENT_SECRET");
-pub const SPOTIFY_REFRESH_TOKEN: &str = env!("SPOTIFY_REFRESH_TOKEN");
+/// `ip:port` of the server's device listener.
+pub const SERVER_ADDR: &str = env!("SERVER_ADDR");
