@@ -53,12 +53,15 @@ pub fn start(
     dma: DMA_I2S0<'static>,
     pins: Hub75Pins16<'static>,
 ) {
-    // Built at compile time: each buffer is larger than the main stack, so
-    // constructing them at runtime would overflow it
-    static FRONT: ConstStaticCell<FrameBuffer> = ConstStaticCell::new(FrameBuffer::new());
-    static BACK: ConstStaticCell<FrameBuffer> = ConstStaticCell::new(FrameBuffer::new());
+    // Each buffer is larger than the main stack, so constructing one at
+    // runtime would overflow it; zeroed statics formatted in place also keep
+    // a formatted copy of both out of the firmware image
+    static FRONT: ConstStaticCell<FrameBuffer> = ConstStaticCell::new(FrameBuffer::unformatted());
+    static BACK: ConstStaticCell<FrameBuffer> = ConstStaticCell::new(FrameBuffer::unformatted());
     let front = FRONT.take();
     let back = BACK.take();
+    front.format();
+    back.format();
 
     let hub75 = Hub75::new_async(
         i2s,

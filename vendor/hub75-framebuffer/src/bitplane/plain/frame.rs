@@ -119,6 +119,23 @@ pub struct PlaneData<const NROWS: usize, const COLS: usize> {
 }
 
 impl<const NROWS: usize, const COLS: usize> PlaneData<NROWS, COLS> {
+    /// Every word zero, so a `static` of it lands in zero-initialized RAM;
+    /// [`DmaFrameBuffer::format`] overwrites every word.
+    const fn zeroed() -> Self {
+        Self {
+            rows: [Row {
+                data: [Entry::from_raw(0); COLS],
+                gap: [Entry::from_raw(0); INTER_ROW_BLANK],
+            }; NROWS],
+            #[cfg(all(feature = "esp32-ordering", feature = "tail-closes-latch"))]
+            padding: Entry::from_raw(0),
+            #[cfg(feature = "tail-closes-latch")]
+            tail: Entry::from_raw(0),
+            #[cfg(all(not(feature = "esp32-ordering"), feature = "tail-closes-latch"))]
+            padding: Entry::from_raw(0),
+        }
+    }
+
     const fn new() -> Self {
         Self {
             rows: [Row::new(); NROWS],
@@ -198,6 +215,27 @@ impl<const NROWS: usize, const COLS: usize, const PLANES: usize>
         };
         instance.format();
         instance
+    }
+
+    /// Creates an all-zero frame buffer; call [`Self::format`] before use.
+    /// Its output-enable bits are not blanked, so it must never be shown
+    /// unformatted.
+    ///
+    /// An all-zero `static` is placed in zero-initialized RAM, whereas the
+    /// formatted one from [`Self::new`] is stored in the firmware image and
+    /// copied out at boot.
+    #[must_use]
+    pub const fn unformatted() -> Self {
+        assert!(NROWS >= 1 && NROWS <= 32, "NROWS must be within 1..=32");
+        assert!(PLANES >= 1 && PLANES <= 8, "PLANES must be within 1..=8");
+        #[cfg(feature = "esp32-ordering")]
+        assert!(
+            COLS % 2 == 0,
+            "esp32-ordering feature requires COLS to be even"
+        );
+        Self {
+            planes: [PlaneData::zeroed(); PLANES],
+        }
     }
 
     /// Returns the number of BCM chunks (one per bit-plane).
@@ -799,6 +837,13 @@ mod tests {
 
         fb.set_brightness(255);
         assert_eq!(lit_entries(&fb), full);
+    }
+
+    #[test]
+    fn formatting_an_unformatted_buffer_matches_new() {
+        let mut fb = TestBuffer::unformatted();
+        fb.format();
+        assert!(fb.planes == TestBuffer::new().planes);
     }
 
     #[test]
