@@ -32,7 +32,6 @@ impl Brightness {
 pub struct GammaExponent(u16);
 
 impl GammaExponent {
-    pub const DEFAULT: GammaExponent = GammaExponent(220);
     const RANGE: RangeInclusive<u16> = 100..=400;
 
     pub fn from_hundredths(hundredths: u16) -> Option<Self> {
@@ -89,8 +88,12 @@ pub struct Tuning {
 impl Tuning {
     pub const DEFAULT: Tuning = Tuning {
         brightness: Brightness(20),
-        gamma: GammaExponent::DEFAULT,
-        white_balance: WhiteBalance::NEUTRAL,
+        gamma: GammaExponent(235),
+        white_balance: WhiteBalance {
+            red: 100,
+            green: 100,
+            blue: 90,
+        },
     };
 }
 
@@ -139,6 +142,10 @@ impl ColorCorrection {
 mod tests {
     use super::*;
 
+    fn gamma(hundredths: u16) -> GammaExponent {
+        GammaExponent::from_hundredths(hundredths).unwrap()
+    }
+
     const WHITE: Rgb = Rgb {
         r: 255,
         g: 255,
@@ -155,7 +162,7 @@ mod tests {
 
     #[test]
     fn full_depth_keeps_endpoints_and_darkens_midtones() {
-        let correction = ColorCorrection::new(GammaExponent::DEFAULT, WhiteBalance::NEUTRAL, 8);
+        let correction = ColorCorrection::new(gamma(220), WhiteBalance::NEUTRAL, 8);
         assert_eq!(correction.apply(grey(0)), grey(0));
         assert_eq!(correction.apply(WHITE), WHITE);
         assert_eq!(correction.apply(grey(128)), grey(56));
@@ -163,7 +170,7 @@ mod tests {
 
     #[test]
     fn rounds_to_nearest_panel_level_instead_of_truncating() {
-        let correction = ColorCorrection::new(GammaExponent::DEFAULT, WhiteBalance::NEUTRAL, 6);
+        let correction = ColorCorrection::new(gamma(220), WhiteBalance::NEUTRAL, 6);
         // sRGB 34 is 1.2% linear, three quarters of a 6-bit step; truncating
         // the 8-bit value would show it as black
         assert_eq!(correction.apply(grey(34)), grey(1 << 2));
@@ -175,7 +182,7 @@ mod tests {
     #[test]
     fn white_balance_scales_each_channel() {
         let balance = WhiteBalance::new(100, 80, 50).unwrap();
-        let correction = ColorCorrection::new(GammaExponent::DEFAULT, balance, 8);
+        let correction = ColorCorrection::new(gamma(220), balance, 8);
         assert_eq!(
             correction.apply(WHITE),
             Rgb {

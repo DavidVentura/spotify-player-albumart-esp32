@@ -221,10 +221,10 @@ mod tests {
             json,
             TuningJson {
                 brightness: 20,
-                gamma_hundredths: 220,
+                gamma_hundredths: 235,
                 red: 100,
                 green: 100,
-                blue: 100
+                blue: 90
             }
         );
         assert_eq!(Tuning::try_from(json), Ok(Tuning::DEFAULT));
