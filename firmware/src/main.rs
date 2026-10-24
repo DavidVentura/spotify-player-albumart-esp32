@@ -75,4 +75,18 @@ async fn main(spawner: Spawner) {
 
     let stack = wifi::connect(spawner, peripherals.WIFI, seed).await;
     spawner.spawn(link::run(stack, server).expect("link task is spawned once"));
+    spawner.spawn(health().expect("health task is spawned once"));
+}
+
+#[embassy_executor::task]
+async fn health() {
+    loop {
+        embassy_time::Timer::after(embassy_time::Duration::from_secs(5)).await;
+        log::info!(
+            "Health: heap {} used, {} free; link received {} bytes",
+            esp_alloc::HEAP.used(),
+            esp_alloc::HEAP.free(),
+            link::RECEIVED_BYTES.swap(0, core::sync::atomic::Ordering::Relaxed),
+        );
+    }
 }

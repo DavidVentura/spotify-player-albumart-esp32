@@ -1,4 +1,5 @@
 use core::net::SocketAddrV4;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use album_art_core::protocol::{Message, MessageReader, ProtocolError};
 use embassy_net::Stack;
@@ -16,6 +17,8 @@ const READ_CHUNK: usize = 1024;
 /// without closing the connection.
 const KEEP_ALIVE: Duration = Duration::from_secs(10);
 const TIMEOUT: Duration = Duration::from_secs(30);
+
+pub static RECEIVED_BYTES: AtomicU32 = AtomicU32::new(0);
 
 #[derive(Debug)]
 #[expect(dead_code, reason = "fields are only read through Debug when logged")]
@@ -55,6 +58,7 @@ async fn receive(socket: &mut TcpSocket<'_>, server: SocketAddrV4) -> Result<(),
         if read == 0 {
             return Err(LinkError::Closed);
         }
+        RECEIVED_BYTES.fetch_add(read as u32, Ordering::Relaxed);
         let messages = reader.feed(&chunk[..read]).map_err(LinkError::Protocol)?;
         for message in messages {
             match message {
