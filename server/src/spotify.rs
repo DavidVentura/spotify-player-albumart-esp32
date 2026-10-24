@@ -55,6 +55,20 @@ pub enum Artwork {
     Image(ImageUrl),
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NowPlaying {
+    pub artwork: Artwork,
+    /// How much of the current item is left, while something plays.
+    pub remaining: Option<Duration>,
+}
+
+impl NowPlaying {
+    const NOTHING: NowPlaying = NowPlaying {
+        artwork: Artwork::Nothing,
+        remaining: None,
+    };
+}
+
 #[derive(Debug)]
 #[expect(dead_code, reason = "fields are only read through Debug when logged")]
 pub enum SpotifyError {
@@ -81,14 +95,15 @@ struct TokenResponse {
 #[derive(Deserialize)]
 struct CurrentlyPlaying {
     is_playing: bool,
+    progress_ms: Option<u64>,
     item: Option<Item>,
 }
 
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 enum Item {
-    Track { album: Album },
-    Episode { images: Vec<Image> },
+    Track { album: Album, duration_ms: u64 },
+    Episode { images: Vec<Image>, duration_ms: u64 },
 }
 
 #[derive(Deserialize)]
@@ -124,7 +139,7 @@ impl SpotifyClient {
         }
     }
 
-    pub async fn now_playing(&mut self) -> Result<Artwork, SpotifyError> {
+    pub async fn now_playing(&mut self) -> Result<NowPlaying, SpotifyError> {
         let token = self.access_token().await?;
         let response = self
             .http
@@ -134,11 +149,11 @@ impl SpotifyClient {
             .await?;
         let status = response.status();
         let body = response.bytes().await?;
-        let artwork = parse_now_playing(status, &body);
-        if let Err(SpotifyError::Unauthorized) = artwork {
+        let now_playing = parse_now_playing(status, &body);
+        if let Err(SpotifyError::Unauthorized) = now_playing {
             self.access = None;
         }
-        artwork
+        now_playing
     }
 
     pub async fn image(&self, url: &ImageUrl) -> Result<Vec<u8>, SpotifyError> {
@@ -190,28 +205,35 @@ fn parse_token_response(status: StatusCode, body: &[u8]) -> Result<TokenGrant, S
     })
 }
 
-fn parse_now_playing(status: StatusCode, body: &[u8]) -> Result<Artwork, SpotifyError> {
+fn parse_now_playing(status: StatusCode, body: &[u8]) -> Result<NowPlaying, SpotifyError> {
     match status {
-        StatusCode::NO_CONTENT => return Ok(Artwork::Nothing),
+        StatusCode::NO_CONTENT => return Ok(NowPlaying::NOTHING),
         StatusCode::UNAUTHORIZED => return Err(SpotifyError::Unauthorized),
         StatusCode::OK => {}
         status => return Err(SpotifyError::Status(status)),
     }
     let playing: CurrentlyPlaying = serde_json::from_slice(body).map_err(SpotifyError::Json)?;
     if !playing.is_playing {
-        return Ok(Artwork::Nothing);
+        return Ok(NowPlaying::NOTHING);
     }
-    let images = match playing.item {
-        None => return Ok(Artwork::Nothing),
-        Some(Item::Track { album }) => album.images,
-        Some(Item::Episode { images }) => images,
+    let (images, duration_ms) = match playing.item {
+        None => return Ok(NowPlaying::NOTHING),
+        Some(Item::Track { album, duration_ms }) => (album.images, duration_ms),
+        Some(Item::Episode {
+            images,
+            duration_ms,
+        }) => (images, duration_ms),
     };
+    let remaining = playing
+        .progress_ms
+        .map(|progress_ms| Duration::from_millis(duration_ms.saturating_sub(progress_ms)));
     // The largest cover downsamples into the cleanest 64x64; local files have
     // no images at all
-    let Some(largest) = images.iter().max_by_key(|image| image.width) else {
-        return Ok(Artwork::Nothing);
+    let artwork = match images.iter().max_by_key(|image| image.width) {
+        None => Artwork::Nothing,
+        Some(largest) => Artwork::Image(ImageUrl::parse(&largest.url)?),
     };
-    ImageUrl::parse(&largest.url).map(Artwork::Image)
+    Ok(NowPlaying { artwork, remaining })
 }
 
 #[cfg(test)]
@@ -255,8 +277,12 @@ mod tests {
         Artwork::Image(ImageUrl(url.to_string()))
     }
 
-    fn now_playing(body: &str) -> Result<Artwork, SpotifyError> {
+    fn now_playing(body: &str) -> Result<NowPlaying, SpotifyError> {
         parse_now_playing(StatusCode::OK, body.as_bytes())
+    }
+
+    fn artwork(body: &str) -> Artwork {
+        now_playing(body).unwrap().artwork
     }
 
     #[test]
@@ -296,21 +322,37 @@ mod tests {
 
     #[test]
     fn playing_track_selects_largest_image() {
-        let artwork = now_playing(&track(true, ALBUM_IMAGES)).unwrap();
-        assert_eq!(artwork, image("https://i.scdn.co/image/big"));
+        assert_eq!(
+            artwork(&track(true, ALBUM_IMAGES)),
+            image("https://i.scdn.co/image/big")
+        );
+    }
+
+    #[test]
+    fn playing_track_reports_time_left() {
+        assert_eq!(
+            now_playing(&track(true, ALBUM_IMAGES)).unwrap().remaining,
+            Some(Duration::from_millis(200_000 - 1234))
+        );
+    }
+
+    #[test]
+    fn local_file_without_images_still_reports_time_left() {
+        assert_eq!(
+            now_playing(&track(true, "[]")).unwrap(),
+            NowPlaying {
+                artwork: Artwork::Nothing,
+                remaining: Some(Duration::from_millis(200_000 - 1234)),
+            }
+        );
     }
 
     #[test]
     fn paused_track_shows_nothing() {
         assert_eq!(
             now_playing(&track(false, ALBUM_IMAGES)).unwrap(),
-            Artwork::Nothing
+            NowPlaying::NOTHING
         );
-    }
-
-    #[test]
-    fn local_file_without_images_shows_nothing() {
-        assert_eq!(now_playing(&track(true, "[]")).unwrap(), Artwork::Nothing);
     }
 
     #[test]
@@ -330,27 +372,25 @@ mod tests {
             "item": {
                 "type": "episode",
                 "name": "Episode",
+                "duration_ms": 1000,
                 "images": [{"height": 64, "url": "https://i.scdn.co/image/ep", "width": 64}],
                 "show": {"name": "Show", "images": []}
             }
         }"#;
-        assert_eq!(
-            now_playing(body).unwrap(),
-            image("https://i.scdn.co/image/ep")
-        );
+        assert_eq!(artwork(body), image("https://i.scdn.co/image/ep"));
     }
 
     #[test]
     fn ad_without_item_shows_nothing() {
         let body = r#"{"is_playing": true, "currently_playing_type": "ad", "item": null}"#;
-        assert_eq!(now_playing(body).unwrap(), Artwork::Nothing);
+        assert_eq!(now_playing(body).unwrap(), NowPlaying::NOTHING);
     }
 
     #[test]
     fn no_content_shows_nothing() {
         assert_eq!(
             parse_now_playing(StatusCode::NO_CONTENT, b"").unwrap(),
-            Artwork::Nothing
+            NowPlaying::NOTHING
         );
     }
 

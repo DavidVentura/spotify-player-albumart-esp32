@@ -13,12 +13,18 @@ use album_art_core::color::Tuning;
 use album_art_core::protocol::Frame;
 use log::{info, warn};
 use tokio::sync::watch;
+use tokio::time::Instant;
 
 use crate::config::Config;
 use crate::playback::Source;
-use crate::spotify::{Artwork, SpotifyClient, SpotifyError};
+use crate::spotify::{Artwork, NowPlaying, SpotifyClient, SpotifyError};
 
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
+// Spotify reports the next track only after the player has moved on to it
+const TRACK_END_MARGIN: Duration = Duration::from_millis(250);
+// Bounds the polling rate while Spotify still reports a track that should
+// have ended
+const MIN_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -59,32 +65,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn follow_spotify(mut spotify: SpotifyClient, covers: &watch::Sender<Arc<Frame>>) {
     let mut shown = Artwork::Nothing;
     loop {
-        match update(&mut spotify, &shown, covers).await {
-            Ok(artwork) => shown = artwork,
-            Err(e) => warn!("Spotify: {e:?}"),
-        }
-        tokio::time::sleep(POLL_INTERVAL).await;
+        let polled_at = Instant::now();
+        let remaining = match update(&mut spotify, &shown, covers).await {
+            Ok(now_playing) => {
+                shown = now_playing.artwork;
+                now_playing.remaining
+            }
+            Err(e) => {
+                warn!("Spotify: {e:?}");
+                None
+            }
+        };
+        tokio::time::sleep_until(polled_at + poll_delay(remaining)).await;
     }
 }
 
-/// Publishes a new frame when what is playing changed, and returns what is
-/// shown now.
+/// Polls again right after the current item ends, so natural track changes
+/// show up without waiting for the regular interval.
+fn poll_delay(remaining: Option<Duration>) -> Duration {
+    let Some(remaining) = remaining else {
+        return POLL_INTERVAL;
+    };
+    (remaining + TRACK_END_MARGIN).clamp(MIN_POLL_INTERVAL, POLL_INTERVAL)
+}
+
+/// Publishes a new frame when the artwork changed.
 async fn update(
     spotify: &mut SpotifyClient,
     shown: &Artwork,
     covers: &watch::Sender<Arc<Frame>>,
-) -> Result<Artwork, UpdateError> {
-    let artwork = spotify.now_playing().await?;
-    if artwork == *shown {
-        return Ok(artwork);
+) -> Result<NowPlaying, UpdateError> {
+    let now_playing = spotify.now_playing().await?;
+    if now_playing.artwork == *shown {
+        return Ok(now_playing);
     }
-    info!("Now showing {artwork:?}");
-    let frame = match &artwork {
+    info!("Now showing {:?}", now_playing.artwork);
+    let frame = match &now_playing.artwork {
         Artwork::Nothing => Frame::black(),
         Artwork::Image(url) => scale::to_frame(&spotify.image(url).await?)?,
     };
     covers.send_replace(Arc::new(frame));
-    Ok(artwork)
+    Ok(now_playing)
 }
 
 #[derive(Debug)]
@@ -103,5 +124,33 @@ impl From<SpotifyError> for UpdateError {
 impl From<image::ImageError> for UpdateError {
     fn from(e: image::ImageError) -> Self {
         UpdateError::Image(e)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nothing_playing_polls_at_the_regular_interval() {
+        assert_eq!(poll_delay(None), POLL_INTERVAL);
+    }
+
+    #[test]
+    fn long_track_polls_at_the_regular_interval() {
+        assert_eq!(poll_delay(Some(Duration::from_secs(60))), POLL_INTERVAL);
+    }
+
+    #[test]
+    fn ending_track_polls_just_after_it_ends() {
+        assert_eq!(
+            poll_delay(Some(Duration::from_millis(800))),
+            Duration::from_millis(800) + TRACK_END_MARGIN
+        );
+    }
+
+    #[test]
+    fn overdue_track_does_not_poll_faster_than_the_minimum() {
+        assert_eq!(poll_delay(Some(Duration::ZERO)), MIN_POLL_INTERVAL);
     }
 }
