@@ -4,8 +4,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use album_art_core::protocol::Frame;
-
+use crate::frame::Frame;
 use crate::scale;
 
 pub struct Preset {

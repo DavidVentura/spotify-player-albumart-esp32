@@ -3,10 +3,12 @@
 use std::io::Cursor;
 use std::time::Duration;
 
-use album_art_core::color::Rgb;
-use album_art_core::protocol::{Frame, SIZE};
+use album_art_core::protocol::SIZE;
 use image::codecs::gif::GifDecoder;
 use image::{AnimationDecoder, DynamicImage, ImageError};
+
+use crate::color::Rgb;
+use crate::frame::Frame;
 
 /// GIFs often declare a zero delay; browsers show those at 10 fps, and so do we.
 const MIN_FRAME_DELAY: Duration = Duration::from_millis(20);

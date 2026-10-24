@@ -1,7 +1,6 @@
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use album_art_core::color::{ColorCorrection, Tuning};
-use album_art_core::protocol::{Frame, SIZE};
+use album_art_core::protocol::{Brightness, PANEL_BITS, PanelFrame, SIZE};
 use embassy_executor::Spawner;
 use embassy_futures::select::{Either, select};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
@@ -17,7 +16,7 @@ use log::info;
 use static_cell::ConstStaticCell;
 
 const NROWS: usize = compute_rows(SIZE);
-const PLANES: usize = 6;
+const PLANES: usize = PANEL_BITS as usize;
 /// The ESP32's I2S peripheral tops out at 19 MHz.
 const PIXEL_CLOCK: Rate = Rate::from_mhz(19);
 
@@ -29,8 +28,8 @@ const _: () = assert!(REFRESH_HZ >= 120);
 
 const STATS_INTERVAL: Duration = Duration::from_secs(5);
 
-static FRAME: Signal<CriticalSectionRawMutex, Frame> = Signal::new();
-static TUNING: Signal<CriticalSectionRawMutex, Tuning> = Signal::new();
+static FRAME: Signal<CriticalSectionRawMutex, PanelFrame> = Signal::new();
+static BRIGHTNESS: Signal<CriticalSectionRawMutex, Brightness> = Signal::new();
 
 // A frame that arrives while another is pending replaces it, so received and
 // drawn diverge when the panel cannot keep up
@@ -39,13 +38,13 @@ static DRAWN: AtomicU32 = AtomicU32::new(0);
 static RENDER_MICROS: AtomicU32 = AtomicU32::new(0);
 static SWAP_MICROS: AtomicU32 = AtomicU32::new(0);
 
-pub fn show(frame: Frame) {
+pub fn show(frame: PanelFrame) {
     RECEIVED.fetch_add(1, Ordering::Relaxed);
     FRAME.signal(frame);
 }
 
-pub fn tune(tuning: Tuning) {
-    TUNING.signal(tuning);
+pub fn set_brightness(brightness: Brightness) {
+    BRIGHTNESS.signal(brightness);
 }
 
 pub fn start(
@@ -60,7 +59,6 @@ pub fn start(
     static BACK: ConstStaticCell<FrameBuffer> = ConstStaticCell::new(FrameBuffer::new());
     let front = FRONT.take();
     let back = BACK.take();
-    front.set_brightness(Tuning::DEFAULT.brightness.duty());
 
     let hub75 = Hub75::new_async(
         i2s,
@@ -104,36 +102,34 @@ async fn display_task(
     hub75: Hub75<esp_hal::Async, FrameBuffer>,
     mut back: &'static mut FrameBuffer,
 ) {
-    let mut frame = Frame::black();
-    let mut tuning = Tuning::DEFAULT;
-    let mut correction = ColorCorrection::new(tuning.gamma, tuning.white_balance, PLANES as u32);
+    let mut frame = PanelFrame::black();
+    // The server sends brightness first; until then nothing is lit
+    let mut brightness = Brightness::OFF;
     loop {
-        match select(FRAME.wait(), TUNING.wait()).await {
+        match select(FRAME.wait(), BRIGHTNESS.wait()).await {
             Either::First(next) => frame = next,
             Either::Second(next) => {
-                tuning = next;
-                correction =
-                    ColorCorrection::new(tuning.gamma, tuning.white_balance, PLANES as u32);
-                let (red, green, blue) = tuning.white_balance.percentages();
-                info!(
-                    "Display: brightness {}%, gamma {}, white balance {red}/{green}/{blue}",
-                    tuning.brightness.percent(),
-                    tuning.gamma.value(),
-                );
+                brightness = next;
+                info!("Display: brightness {}%", brightness.percent());
             }
         }
         let render_start = Instant::now();
         back.erase();
+        // The framebuffer takes 8-bit channels and shows their top bits
+        let shift = 8 - PANEL_BITS;
         for (y, row) in frame.pixels.iter().enumerate() {
-            for (x, &pixel) in row.iter().enumerate() {
-                let pixel = correction.apply(pixel);
+            for (x, color) in row.iter().enumerate() {
                 back.set_pixel(
                     Point::new(x as i32, y as i32),
-                    Color::new(pixel.r, pixel.g, pixel.b),
+                    Color::new(
+                        color.r.value() << shift,
+                        color.g.value() << shift,
+                        color.b.value() << shift,
+                    ),
                 );
             }
         }
-        back.set_brightness(tuning.brightness.duty());
+        back.set_brightness(brightness.duty());
         let swap_start = Instant::now();
         let mut swap = hub75.swap(back).expect("only this task swaps buffers");
         swap.wait_for_done().await;

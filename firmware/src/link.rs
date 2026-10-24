@@ -63,7 +63,7 @@ async fn receive(socket: &mut TcpSocket<'_>, server: SocketAddrV4) -> Result<(),
         for message in messages {
             match message {
                 Message::Frame(frame) => display::show(frame),
-                Message::Tune(tuning) => display::tune(tuning),
+                Message::Brightness(brightness) => display::set_brightness(brightness),
             }
         }
     }

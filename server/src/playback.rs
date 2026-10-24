@@ -3,10 +3,11 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use album_art_core::protocol::Frame;
 use serde::Deserialize;
 use tokio::sync::watch;
 use tokio::time::{Instant, sleep_until};
+
+use crate::frame::Frame;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -112,7 +113,7 @@ async fn play(animation: &Animation, output: &watch::Sender<Arc<Frame>>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use album_art_core::color::Rgb;
+    use crate::color::Rgb;
 
     fn solid(level: u8) -> Frame {
         let mut frame = Frame::black();

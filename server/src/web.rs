@@ -5,8 +5,7 @@ use std::io::Cursor;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use album_art_core::color::{Brightness, GammaExponent, Tuning, WhiteBalance};
-use album_art_core::protocol::{Frame, SIZE};
+use album_art_core::protocol::{Brightness, SIZE};
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{StatusCode, header};
@@ -19,6 +18,8 @@ use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 
+use crate::color::{GammaExponent, Tuning, WhiteBalance};
+use crate::frame::Frame;
 use crate::playback::{Animation, Repeat, Source};
 use crate::presets::Presets;
 use crate::scale;

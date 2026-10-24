@@ -1,89 +1,134 @@
 //! Server-to-panel stream: a sequence of `[kind: u8][length: u32 LE][payload]`
 //! messages over one TCP connection.
+//!
+//! The server does all colour work; the panel receives the exact levels to
+//! drive and only scales them by brightness.
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
-use crate::color::{Brightness, GammaExponent, Rgb, Tuning, WhiteBalance};
-
 /// Edge length of the panel in pixels.
 pub const SIZE: usize = 64;
+/// Brightness levels per channel the panel shows, as a bit depth.
+pub const PANEL_BITS: u32 = 6;
 
-const KIND_FRAME: u8 = 1;
-const KIND_TUNE: u8 = 2;
+// Numbered past the RGB888 protocol's kinds so a panel running older firmware
+// rejects this stream instead of misreading it
+const KIND_FRAME: u8 = 3;
+const KIND_BRIGHTNESS: u8 = 4;
 const HEADER_LEN: usize = 5;
 const FRAME_LEN: usize = SIZE * SIZE * 3;
-const TUNE_LEN: usize = 6;
+const BRIGHTNESS_LEN: usize = 1;
 
-/// A full panel image, indexed as `pixels[y][x]`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Frame {
-    pub pixels: Box<[[Rgb; SIZE]; SIZE]>,
+/// One channel's drive level, `0..=Level::MAX`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Level(u8);
+
+impl Level {
+    pub const MAX: Level = Level((1 << PANEL_BITS) - 1);
+
+    pub fn new(level: u8) -> Option<Self> {
+        (level <= Self::MAX.0).then_some(Level(level))
+    }
+
+    pub fn value(self) -> u8 {
+        self.0
+    }
 }
 
-impl Frame {
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PanelColor {
+    pub r: Level,
+    pub g: Level,
+    pub b: Level,
+}
+
+/// What every LED of the panel shows, indexed as `pixels[y][x]`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PanelFrame {
+    pub pixels: Box<[[PanelColor; SIZE]; SIZE]>,
+}
+
+impl PanelFrame {
     pub fn black() -> Self {
         // Built row by row on the heap; `Box::new` of the whole array would
         // first place 12 KiB on the stack, which is most of a microcontroller's
-        let rows = alloc::vec![[Rgb::default(); SIZE]; SIZE];
+        let rows = alloc::vec![[PanelColor::default(); SIZE]; SIZE];
         let pixels = rows
             .into_boxed_slice()
             .try_into()
             .expect("SIZE rows were allocated");
-        Frame { pixels }
+        PanelFrame { pixels }
     }
 
-    /// `rgb` holds `SIZE * SIZE` row-major RGB triplets.
-    fn from_rgb(rgb: &[u8]) -> Self {
-        let rows: Vec<[Rgb; SIZE]> = rgb
+    /// `levels` holds `SIZE * SIZE` row-major RGB triplets.
+    fn decode(levels: &[u8]) -> Result<Self, ProtocolError> {
+        let level = |byte: u8| Level::new(byte).ok_or(ProtocolError::LevelOutOfRange(byte));
+        let rows = levels
             .chunks_exact(SIZE * 3)
             .map(|row| {
-                core::array::from_fn(|x| Rgb {
-                    r: row[x * 3],
-                    g: row[x * 3 + 1],
-                    b: row[x * 3 + 2],
-                })
+                let mut colors = [PanelColor::default(); SIZE];
+                for (color, rgb) in colors.iter_mut().zip(row.chunks_exact(3)) {
+                    *color = PanelColor {
+                        r: level(rgb[0])?,
+                        g: level(rgb[1])?,
+                        b: level(rgb[2])?,
+                    };
+                }
+                Ok(colors)
             })
-            .collect();
+            .collect::<Result<Vec<_>, _>>()?;
         let pixels = rows
             .into_boxed_slice()
             .try_into()
             .expect("FRAME_LEN bytes hold exactly SIZE rows");
-        Frame { pixels }
+        Ok(PanelFrame { pixels })
+    }
+}
+
+/// Panel brightness as a percentage of full output.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Brightness(u8);
+
+impl Brightness {
+    pub const OFF: Brightness = Brightness(0);
+
+    pub const fn new(percent: u8) -> Option<Self> {
+        if percent > 100 {
+            return None;
+        }
+        Some(Brightness(percent))
+    }
+
+    pub fn percent(self) -> u8 {
+        self.0
+    }
+
+    /// Fraction of full output in the 0..=255 scale the framebuffer uses.
+    pub fn duty(self) -> u8 {
+        ((u16::from(self.0) * 255 + 50) / 100) as u8
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Message {
-    Frame(Frame),
-    Tune(Tuning),
+    Frame(PanelFrame),
+    Brightness(Brightness),
 }
 
 impl Message {
     pub fn encode(&self) -> Vec<u8> {
         let (kind, payload) = match self {
             Message::Frame(frame) => {
-                let rgb = frame
+                let levels = frame
                     .pixels
                     .iter()
                     .flatten()
-                    .flat_map(|pixel| [pixel.r, pixel.g, pixel.b])
+                    .flat_map(|color| [color.r.0, color.g.0, color.b.0])
                     .collect();
-                (KIND_FRAME, rgb)
+                (KIND_FRAME, levels)
             }
-            Message::Tune(tuning) => {
-                let gamma = tuning.gamma.hundredths().to_le_bytes();
-                let (red, green, blue) = tuning.white_balance.percentages();
-                let payload = Vec::from([
-                    tuning.brightness.percent(),
-                    gamma[0],
-                    gamma[1],
-                    red,
-                    green,
-                    blue,
-                ]);
-                (KIND_TUNE, payload)
-            }
+            Message::Brightness(brightness) => (KIND_BRIGHTNESS, Vec::from([brightness.0])),
         };
         let len = u32::try_from(payload.len()).expect("payloads are a few KiB");
         let mut encoded = Vec::with_capacity(HEADER_LEN + payload.len());
@@ -98,7 +143,8 @@ impl Message {
 pub enum ProtocolError {
     UnknownKind(u8),
     WrongLength { kind: u8, len: usize },
-    InvalidTuning,
+    LevelOutOfRange(u8),
+    InvalidBrightness(u8),
 }
 
 /// Reassembles messages from a byte stream.
@@ -133,7 +179,7 @@ fn decode(data: &[u8]) -> Result<Option<(Message, usize)>, ProtocolError> {
     let len = u32::from_le_bytes(header[1..].try_into().expect("4 length bytes")) as usize;
     let expected = match kind {
         KIND_FRAME => FRAME_LEN,
-        KIND_TUNE => TUNE_LEN,
+        KIND_BRIGHTNESS => BRIGHTNESS_LEN,
         _ => return Err(ProtocolError::UnknownKind(kind)),
     };
     // Checked before waiting for the payload, so a corrupt length cannot make
@@ -145,18 +191,12 @@ fn decode(data: &[u8]) -> Result<Option<(Message, usize)>, ProtocolError> {
         return Ok(None);
     };
     let message = match kind {
-        KIND_FRAME => Message::Frame(Frame::from_rgb(payload)),
-        _ => Message::Tune(decode_tuning(payload).ok_or(ProtocolError::InvalidTuning)?),
+        KIND_FRAME => Message::Frame(PanelFrame::decode(payload)?),
+        _ => Message::Brightness(
+            Brightness::new(payload[0]).ok_or(ProtocolError::InvalidBrightness(payload[0]))?,
+        ),
     };
     Ok(Some((message, HEADER_LEN + len)))
-}
-
-fn decode_tuning(payload: &[u8]) -> Option<Tuning> {
-    Some(Tuning {
-        brightness: Brightness::new(payload[0])?,
-        gamma: GammaExponent::from_hundredths(u16::from_le_bytes([payload[1], payload[2]]))?,
-        white_balance: WhiteBalance::new(payload[3], payload[4], payload[5])?,
-    })
 }
 
 #[cfg(test)]
@@ -164,31 +204,27 @@ mod tests {
     use super::*;
     use alloc::vec;
 
-    fn gradient() -> Frame {
-        let mut frame = Frame::black();
+    fn gradient() -> PanelFrame {
+        let mut frame = PanelFrame::black();
         for (y, row) in frame.pixels.iter_mut().enumerate() {
-            for (x, pixel) in row.iter_mut().enumerate() {
-                *pixel = Rgb {
-                    r: x as u8 * 4,
-                    g: y as u8 * 4,
-                    b: (x + y) as u8,
+            for (x, color) in row.iter_mut().enumerate() {
+                *color = PanelColor {
+                    r: Level::new(x as u8).unwrap(),
+                    g: Level::new(y as u8).unwrap(),
+                    b: Level::new(((x + y) / 2) as u8).unwrap(),
                 };
             }
         }
         frame
     }
 
-    fn tuning() -> Tuning {
-        Tuning {
-            brightness: Brightness::new(35).unwrap(),
-            gamma: GammaExponent::from_hundredths(260).unwrap(),
-            white_balance: WhiteBalance::new(100, 80, 65).unwrap(),
-        }
+    fn brightness() -> Brightness {
+        Brightness::new(35).unwrap()
     }
 
     #[test]
     fn round_trips_messages_split_at_every_byte() {
-        let messages = vec![Message::Tune(tuning()), Message::Frame(gradient())];
+        let messages = vec![Message::Brightness(brightness()), Message::Frame(gradient())];
         let stream: Vec<u8> = messages.iter().flat_map(Message::encode).collect();
         for cut in 0..stream.len() {
             let mut reader = MessageReader::default();
@@ -199,20 +235,37 @@ mod tests {
     }
 
     #[test]
-    fn tune_encoding_is_stable() {
+    fn brightness_encoding_is_stable() {
         assert_eq!(
-            Message::Tune(tuning()).encode(),
-            vec![2, 6, 0, 0, 0, 35, 0x04, 0x01, 100, 80, 65]
+            Message::Brightness(brightness()).encode(),
+            vec![4, 1, 0, 0, 0, 35]
         );
     }
 
     #[test]
-    fn frame_payload_is_row_major_rgb() {
+    fn frame_payload_is_row_major_levels() {
         let encoded = Message::Frame(gradient()).encode();
-        assert_eq!(&encoded[..HEADER_LEN], &[1, 0x00, 0x30, 0, 0]);
+        assert_eq!(&encoded[..HEADER_LEN], &[3, 0x00, 0x30, 0, 0]);
         // pixel (x=2, y=1)
         let offset = HEADER_LEN + (SIZE + 2) * 3;
-        assert_eq!(&encoded[offset..offset + 3], &[8, 4, 3]);
+        assert_eq!(&encoded[offset..offset + 3], &[2, 1, 1]);
+    }
+
+    #[test]
+    fn levels_stop_at_the_panel_depth() {
+        assert_eq!(Level::MAX.value(), 63);
+        assert!(Level::new(64).is_none());
+    }
+
+    #[test]
+    fn rejects_levels_beyond_the_panel_depth() {
+        let mut encoded = Message::Frame(PanelFrame::black()).encode();
+        encoded[HEADER_LEN + 7] = 64;
+        let mut reader = MessageReader::default();
+        assert_eq!(
+            reader.feed(&encoded),
+            Err(ProtocolError::LevelOutOfRange(64))
+        );
     }
 
     #[test]
@@ -225,23 +278,39 @@ mod tests {
     }
 
     #[test]
+    fn rejects_the_rgb888_protocol() {
+        let mut reader = MessageReader::default();
+        assert_eq!(
+            reader.feed(&[1, 0x00, 0x30, 0, 0]),
+            Err(ProtocolError::UnknownKind(1))
+        );
+    }
+
+    #[test]
     fn rejects_wrong_length_before_buffering_payload() {
         let mut reader = MessageReader::default();
         assert_eq!(
-            reader.feed(&[1, 0xff, 0xff, 0xff, 0x7f]),
+            reader.feed(&[3, 0xff, 0xff, 0xff, 0x7f]),
             Err(ProtocolError::WrongLength {
-                kind: 1,
+                kind: 3,
                 len: 0x7fff_ffff
             })
         );
     }
 
     #[test]
-    fn rejects_out_of_range_tuning() {
+    fn rejects_out_of_range_brightness() {
         let mut reader = MessageReader::default();
         assert_eq!(
-            reader.feed(&[2, 6, 0, 0, 0, 101, 220, 0, 100, 100, 100]),
-            Err(ProtocolError::InvalidTuning)
+            reader.feed(&[4, 1, 0, 0, 0, 101]),
+            Err(ProtocolError::InvalidBrightness(101))
         );
+    }
+
+    #[test]
+    fn brightness_duty_spans_the_framebuffer_scale() {
+        assert_eq!(Brightness::OFF.duty(), 0);
+        assert_eq!(Brightness::new(100).unwrap().duty(), 255);
+        assert_eq!(brightness().duty(), 89);
     }
 }

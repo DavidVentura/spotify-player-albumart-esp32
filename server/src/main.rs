@@ -1,5 +1,7 @@
+mod color;
 mod config;
 mod device;
+mod frame;
 mod playback;
 mod presets;
 mod scale;
@@ -9,13 +11,13 @@ mod web;
 use std::sync::Arc;
 use std::time::Duration;
 
-use album_art_core::color::Tuning;
-use album_art_core::protocol::Frame;
 use log::{info, warn};
 use tokio::sync::watch;
 use tokio::time::Instant;
 
+use crate::color::Tuning;
 use crate::config::Config;
+use crate::frame::Frame;
 use crate::playback::Source;
 use crate::spotify::{Artwork, NowPlaying, SpotifyClient, SpotifyError};
 
