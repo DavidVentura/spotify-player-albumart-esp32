@@ -6,7 +6,7 @@ use embassy_time::{Duration, Instant, Timer};
 use embedded_graphics::geometry::Point;
 use esp_hal::peripherals::{DMA_I2S0, I2S0};
 use esp_hal::time::Rate;
-use esp_hub75::framebuffer::bitplane::plain::DmaFrameBuffer;
+use esp_hub75::framebuffer::bitplane::plain::hold::{DmaFrameBuffer, Holds};
 use esp_hub75::framebuffer::compute_rows;
 use esp_hub75::{Color, Hub75, Hub75Config, Hub75Pins16};
 use log::info;
@@ -19,9 +19,11 @@ const PIXEL_CLOCK: Rate = Rate::from_mhz(19);
 
 type FrameBuffer = DmaFrameBuffer<NROWS, SIZE, PLANES>;
 
-const REFRESH_HZ: u32 = esp_hub75::refresh_hz::<FrameBuffer>(PIXEL_CLOCK);
-// Below this, the panel visibly flickers in peripheral vision
-const _: () = assert!(REFRESH_HZ >= 120);
+/// Dimming lengthens rows; below this the panel flickers on camera and in
+/// peripheral vision, so dimmer settings shorten the planes instead.
+const MIN_REFRESH_HZ: u32 = 180;
+const MAX_ROW_CLOCKS: usize = (PIXEL_CLOCK.as_hz() / (MIN_REFRESH_HZ * NROWS as u32)) as usize;
+const _: () = assert!(FrameBuffer::FULL_BRIGHTNESS_ROW_CLOCKS <= MAX_ROW_CLOCKS);
 
 const STATS_INTERVAL: Duration = Duration::from_secs(5);
 
@@ -43,7 +45,7 @@ impl Panel {
     /// needs no erasing before the next one.
     pub async fn present(&mut self) {
         let back = self.back.take().expect("present is not re-entered");
-        back.set_brightness(self.brightness.duty());
+        back.set_brightness(self.brightness.duty(), MAX_ROW_CLOCKS);
         let swap_start = Instant::now();
         let mut swap = self.hub75.swap(back).expect("only the panel swaps buffers");
         swap.wait_for_done().await;
@@ -58,18 +60,12 @@ impl Panel {
 
 impl Target for Panel {
     fn pixel(&mut self, x: usize, y: usize, color: PanelColor) {
-        // The framebuffer takes 8-bit channels and shows their top bits
-        let shift = 8 - PANEL_BITS;
         self.back
             .as_mut()
             .expect("pixels only arrive between swaps")
             .set_pixel(
                 Point::new(x as i32, y as i32),
-                Color::new(
-                    color.r.value() << shift,
-                    color.g.value() << shift,
-                    color.b.value() << shift,
-                ),
+                Color::new(color.r.value(), color.g.value(), color.b.value()),
             );
     }
 
@@ -77,7 +73,13 @@ impl Target for Panel {
     /// after a brightness change.
     fn brightness(&mut self, brightness: Brightness) {
         self.brightness = brightness;
-        info!("Display: brightness {}%", brightness.percent());
+        let back = self.back.as_mut().expect("brightness only arrives between swaps");
+        back.set_brightness(brightness.duty(), MAX_ROW_CLOCKS);
+        info!(
+            "Display: brightness {}%, refreshing at {} Hz",
+            brightness.percent(),
+            PIXEL_CLOCK.as_hz() as usize / (back.row_clocks() * NROWS),
+        );
     }
 }
 
@@ -92,10 +94,14 @@ pub fn start(
     // a formatted copy of both out of the firmware image
     static FRONT: ConstStaticCell<FrameBuffer> = ConstStaticCell::new(FrameBuffer::unformatted());
     static BACK: ConstStaticCell<FrameBuffer> = ConstStaticCell::new(FrameBuffer::unformatted());
+    static HOLDS: ConstStaticCell<Holds<NROWS>> = ConstStaticCell::new(Holds::unformatted());
+    let holds = HOLDS.take();
+    holds.format();
+    let holds: &'static Holds<NROWS> = holds;
     let front = FRONT.take();
     let back = BACK.take();
-    front.format();
-    back.format();
+    front.format(holds);
+    back.format(holds);
 
     let hub75 = Hub75::new_async(
         i2s,
@@ -106,7 +112,6 @@ pub fn start(
         &*front,
     )
     .expect("HUB75 driver starts");
-    info!("Display: refreshing at {REFRESH_HZ} Hz");
 
     spawner.spawn(stats_task().expect("stats task is spawned once"));
     Panel {

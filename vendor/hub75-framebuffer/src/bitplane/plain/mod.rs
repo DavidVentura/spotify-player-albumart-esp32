@@ -65,6 +65,7 @@
 use bitfield::bitfield;
 
 pub mod frame;
+pub mod hold;
 pub mod row;
 
 pub use frame::DmaFrameBuffer;

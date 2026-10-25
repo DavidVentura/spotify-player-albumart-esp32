@@ -411,9 +411,10 @@ impl BcmLenReps {
 
 /// Capacity of the [`FrameBuffer::BCM_SEQUENCE`] array.
 ///
-/// Sized for the worst case sequence: 8 bit-planes plus an inter-row gap
-/// plus an end-of-row trailer.
-pub const BCM_SEQUENCE_CAPACITY: usize = 10;
+/// Sized for the worst case sequence: a shift and a hold for each of 8
+/// bit-planes plus the dark padding of
+/// [`bitplane::plain::hold`](crate::bitplane::plain::hold).
+pub const BCM_SEQUENCE_CAPACITY: usize = 17;
 
 // ---------------------------------------------------------------------------
 // Feature-gated blanking-delay constants (shared across all framebuffer types)

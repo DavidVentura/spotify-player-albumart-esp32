@@ -146,11 +146,10 @@ impl ColorCorrection {
             })
             .min_by(|(a, _), (b, _)| a.total_cmp(b))
             .expect("there are eight candidates");
-        let level = |value: u8| Level::new(value).expect("bounds are clamped to Level::MAX");
         PanelColor {
-            r: level(best[0]),
-            g: level(best[1]),
-            b: level(best[2]),
+            r: Level::new(best[0]),
+            g: Level::new(best[1]),
+            b: Level::new(best[2]),
         }
     }
 }
@@ -206,15 +205,15 @@ mod tests {
     fn keeps_black_and_white_at_the_ends_of_the_scale() {
         let correction = neutral(220);
         assert_eq!(levels(correction.quantize(grey(0))), [0, 0, 0]);
-        assert_eq!(levels(correction.quantize(grey(255))), [63, 63, 63]);
+        assert_eq!(levels(correction.quantize(grey(255))), [255, 255, 255]);
     }
 
     #[test]
     fn rounds_to_the_nearest_level_instead_of_truncating() {
         let correction = neutral(220);
-        // sRGB 34 is 1.2% linear, three quarters of the lowest level
-        assert_eq!(levels(correction.quantize(grey(34))), [1, 1, 1]);
-        assert_eq!(levels(correction.quantize(grey(20))), [0, 0, 0]);
+        // sRGB 18 is 0.29% linear, three quarters of the lowest level
+        assert_eq!(levels(correction.quantize(grey(18))), [1, 1, 1]);
+        assert_eq!(levels(correction.quantize(grey(10))), [0, 0, 0]);
     }
 
     #[test]
@@ -227,8 +226,10 @@ mod tests {
     }
 
     #[test]
-    fn dim_yellow_does_not_turn_red() {
-        // Sampled from a cover whose yellow-to-black gradient showed a red edge
+    fn dim_yellow_turns_red_by_at_most_the_lowest_level() {
+        // Sampled from a cover whose yellow-to-black gradient showed a red
+        // edge. Just above black, a lone lowest red level is genuinely the
+        // nearest colour; a brighter red-only pixel is the band that showed.
         let correction = ColorCorrection::new(gamma(235), WhiteBalance::new(100, 100, 90).unwrap());
         for green_share in [0.76, 0.8, 0.86, 0.9] {
             for value in 1..=255u8 {
@@ -238,7 +239,7 @@ mod tests {
                     b: (f32::from(value) * 0.19).round() as u8,
                 };
                 let [r, g, _] = levels(correction.quantize(yellow));
-                assert!(r == 0 || g > 0, "{yellow:?} became red only: {r}/{g}");
+                assert!(r <= 1 || g > 0, "{yellow:?} became red only: {r}/{g}");
             }
         }
     }
@@ -248,14 +249,14 @@ mod tests {
         let balance = WhiteBalance::new(100, 80, 50).unwrap();
         let correction = ColorCorrection::new(gamma(220), balance);
         let [r, g, b] = levels(correction.quantize(grey(255)));
-        assert_eq!((r, g), (63, 50));
-        assert!((31..=32).contains(&b), "blue {b}");
+        assert_eq!((r, g), (255, 204));
+        assert!((127..=128).contains(&b), "blue {b}");
     }
 
     #[test]
     fn linear_gamma_keeps_proportions() {
         let correction = neutral(100);
-        assert_eq!(levels(correction.quantize(grey(128))), [32, 32, 32]);
+        assert_eq!(levels(correction.quantize(grey(128))), [128, 128, 128]);
     }
 
     #[test]

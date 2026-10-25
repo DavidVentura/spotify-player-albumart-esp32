@@ -10,11 +10,11 @@ use alloc::vec::Vec;
 /// Edge length of the panel in pixels.
 pub const SIZE: usize = 64;
 /// Brightness levels per channel the panel shows, as a bit depth.
-pub const PANEL_BITS: u32 = 6;
+pub const PANEL_BITS: u32 = 8;
 
 // Numbered past the RGB888 protocol's kinds so a panel running older firmware
 // rejects this stream instead of misreading it
-const KIND_FRAME: u8 = 3;
+const KIND_FRAME: u8 = 5;
 const KIND_BRIGHTNESS: u8 = 4;
 const HEADER_LEN: usize = 5;
 const FRAME_LEN: usize = SIZE * SIZE * 3;
@@ -24,11 +24,13 @@ const BRIGHTNESS_LEN: usize = 1;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Level(u8);
 
-impl Level {
-    pub const MAX: Level = Level((1 << PANEL_BITS) - 1);
+const _: () = assert!(PANEL_BITS == u8::BITS, "every byte is a level");
 
-    pub fn new(level: u8) -> Option<Self> {
-        (level <= Self::MAX.0).then_some(Level(level))
+impl Level {
+    pub const MAX: Level = Level(u8::MAX);
+
+    pub const fn new(level: u8) -> Self {
+        Level(level)
     }
 
     pub fn value(self) -> u8 {
@@ -119,7 +121,6 @@ impl Message {
 pub enum ProtocolError {
     UnknownKind(u8),
     WrongLength { kind: u8, len: usize },
-    LevelOutOfRange(u8),
     InvalidBrightness(u8),
 }
 
@@ -204,13 +205,11 @@ impl StreamDecoder {
                     if *offset % 3 != 0 {
                         continue;
                     }
-                    let level =
-                        |byte: u8| Level::new(byte).ok_or(ProtocolError::LevelOutOfRange(byte));
                     let pixel = *offset / 3 - 1;
                     let color = PanelColor {
-                        r: level(channels[0])?,
-                        g: level(channels[1])?,
-                        b: level(channels[2])?,
+                        r: Level::new(channels[0]),
+                        g: Level::new(channels[1]),
+                        b: Level::new(channels[2]),
                     };
                     target.pixel(pixel % SIZE, pixel / SIZE, color);
                     if *offset == FRAME_LEN {
@@ -265,9 +264,9 @@ mod tests {
         for (y, row) in frame.pixels.iter_mut().enumerate() {
             for (x, color) in row.iter_mut().enumerate() {
                 *color = PanelColor {
-                    r: Level::new(x as u8).unwrap(),
-                    g: Level::new(y as u8).unwrap(),
-                    b: Level::new(((x + y) / 2) as u8).unwrap(),
+                    r: Level::new(x as u8),
+                    g: Level::new(y as u8),
+                    b: Level::new(((x + y) / 2) as u8),
                 };
             }
         }
@@ -372,23 +371,10 @@ mod tests {
     #[test]
     fn frame_payload_is_row_major_levels() {
         let encoded = Message::Frame(gradient()).encode();
-        assert_eq!(&encoded[..HEADER_LEN], &[3, 0x00, 0x30, 0, 0]);
+        assert_eq!(&encoded[..HEADER_LEN], &[5, 0x00, 0x30, 0, 0]);
         // pixel (x=2, y=1)
         let offset = HEADER_LEN + (SIZE + 2) * 3;
         assert_eq!(&encoded[offset..offset + 3], &[2, 1, 1]);
-    }
-
-    #[test]
-    fn levels_stop_at_the_panel_depth() {
-        assert_eq!(Level::MAX.value(), 63);
-        assert!(Level::new(64).is_none());
-    }
-
-    #[test]
-    fn rejects_levels_beyond_the_panel_depth() {
-        let mut encoded = Message::Frame(PanelFrame::black()).encode();
-        encoded[HEADER_LEN + 7] = 64;
-        assert_eq!(decode(&encoded), Err(ProtocolError::LevelOutOfRange(64)));
     }
 
     #[test]
@@ -407,9 +393,9 @@ mod tests {
     #[test]
     fn rejects_wrong_length_before_reading_the_payload() {
         assert_eq!(
-            decode(&[3, 0xff, 0xff, 0xff, 0x7f]),
+            decode(&[5, 0xff, 0xff, 0xff, 0x7f]),
             Err(ProtocolError::WrongLength {
-                kind: 3,
+                kind: 5,
                 len: 0x7fff_ffff
             })
         );
