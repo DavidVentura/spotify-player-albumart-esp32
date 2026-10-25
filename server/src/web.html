@@ -16,6 +16,8 @@
   label.slider { display: grid; grid-template-columns: 7rem 1fr 3.5rem; gap: .75rem; align-items: center; margin: .9rem 0; }
   output { text-align: right; font-variant-numeric: tabular-nums; }
   #status { color: #f66; min-height: 1.2em; margin-top: 1rem; }
+  #pending { width: 8rem; image-rendering: pixelated; background: #000; margin-top: .6rem; }
+  .hint { color: #888; font-size: .85rem; margin: .4rem 0 0; }
 </style>
 </head>
 <body>
@@ -34,8 +36,10 @@
 <div class="row">
   <input type="file" id="file" accept="image/*">
   <label><input type="checkbox" id="repeat" checked> repeat GIFs</label>
-  <button id="upload">Show</button>
+  <button id="upload" disabled>Show</button>
 </div>
+<p class="hint">or paste an image anywhere on the page</p>
+<img id="pending" alt="How the chosen image will look on the panel" hidden>
 
 <h2>Tuning</h2>
 <label class="slider">Brightness <input type="range" id="brightness" min="0" max="100"><output></output></label>
@@ -68,14 +72,38 @@ document.getElementById("clear").onclick = () => request("POST", "/show/clear");
   }
 })();
 
-document.getElementById("upload").onclick = () => {
-  const file = document.getElementById("file").files[0];
-  if (!file) return;
-  if (file.type === "image/gif") {
+const upload = document.getElementById("upload");
+const pending = document.getElementById("pending");
+let chosen = null;
+const choose = async (file) => {
+  chosen = file;
+  upload.disabled = false;
+  status.textContent = "";
+  const response = await fetch("/preview", { method: "PUT", body: file });
+  // A later choice may have answered first
+  if (chosen !== file) return;
+  if (!response.ok) {
+    pending.hidden = true;
+    status.textContent = await response.text() || response.statusText;
+    return;
+  }
+  URL.revokeObjectURL(pending.src);
+  pending.src = URL.createObjectURL(await response.blob());
+  pending.hidden = false;
+};
+document.getElementById("file").onchange = (event) => {
+  if (event.target.files[0]) choose(event.target.files[0]);
+};
+document.addEventListener("paste", (event) => {
+  const image = [...event.clipboardData.files].find((file) => file.type.startsWith("image/"));
+  if (image) choose(image);
+});
+upload.onclick = () => {
+  if (chosen.type === "image/gif") {
     const repeat = document.getElementById("repeat").checked ? "forever" : "once";
-    request("PUT", "/show/animation?repeat=" + repeat, file);
+    request("PUT", "/show/animation?repeat=" + repeat, chosen);
   } else {
-    request("PUT", "/show/image", file);
+    request("PUT", "/show/image", chosen);
   }
 };
 

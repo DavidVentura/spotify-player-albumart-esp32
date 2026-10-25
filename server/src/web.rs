@@ -93,6 +93,7 @@ pub async fn serve(
         .route("/", get(|| async { Html(PAGE) }))
         .route("/tuning", get(get_tuning).put(put_tuning))
         .route("/frame.stream", get(frame_stream))
+        .route("/preview", put(preview))
         .route("/presets", get(list_presets))
         .route("/presets/{name}", get(preset_image))
         .route("/show/song", post(show_song))
@@ -201,6 +202,18 @@ async fn show_preset(State(state): State<AppState>, Path(name): Path<String>) ->
 }
 
 /// Shows any still image until something else is selected.
+/// What an upload would show, without showing it: the still, or a GIF's
+/// first frame, scaled as the panel gets it.
+async fn preview(image: Bytes) -> Response {
+    let decoded = tokio::task::spawn_blocking(move || scale::to_frame(&image))
+        .await
+        .expect("decoding does not panic");
+    match decoded {
+        Ok(frame) => ([(header::CONTENT_TYPE, "image/png")], encode_png(&frame)).into_response(),
+        Err(e) => (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()).into_response(),
+    }
+}
+
 async fn show_image(State(state): State<AppState>, image: Bytes) -> Response {
     let decoded = tokio::task::spawn_blocking(move || scale::to_frame(&image))
         .await
