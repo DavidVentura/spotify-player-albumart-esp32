@@ -19,7 +19,7 @@
 </style>
 </head>
 <body>
-<img id="frame" src="/frame.png" alt="What the panel is showing">
+<img id="frame" src="/frame.stream" alt="What the panel is showing">
 
 <h2>Show</h2>
 <div class="row">
@@ -101,7 +101,6 @@ const sendTuning = () => {
   }
 })();
 
-setInterval(() => { document.getElementById("frame").src = "/frame.png?" + Date.now(); }, 500);
 </script>
 </body>
 </html>

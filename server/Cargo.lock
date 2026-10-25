@@ -28,6 +28,7 @@ dependencies = [
  "album-art-core",
  "axum",
  "env_logger",
+ "futures-util",
  "image",
  "log",
  "reqwest",

@@ -1,17 +1,20 @@
 //! Browser UI: tuning sliders, what to show (song, presets, uploads, GIFs)
 //! and a preview of the frame the panel is being sent.
 
+use std::convert::Infallible;
 use std::io::Cursor;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use album_art_core::protocol::{Brightness, SIZE};
-use axum::body::Bytes;
+use axum::body::{Body, Bytes};
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
+use futures_util::StreamExt;
+use futures_util::stream;
 use image::{ImageFormat, RgbImage};
 use log::info;
 use serde::{Deserialize, Serialize};
@@ -27,6 +30,7 @@ use crate::scale;
 const PAGE: &str = include_str!("web.html");
 /// Long GIFs such as music videos run to tens of MiB.
 const MAX_UPLOAD: usize = 256 * 1024 * 1024;
+const STREAM_BOUNDARY: &str = "frame";
 
 #[derive(Clone)]
 struct AppState {
@@ -88,7 +92,7 @@ pub async fn serve(
     let app = Router::new()
         .route("/", get(|| async { Html(PAGE) }))
         .route("/tuning", get(get_tuning).put(put_tuning))
-        .route("/frame.png", get(frame_png))
+        .route("/frame.stream", get(frame_stream))
         .route("/presets", get(list_presets))
         .route("/presets/{name}", get(preset_image))
         .route("/show/song", post(show_song))
@@ -122,9 +126,40 @@ async fn put_tuning(State(state): State<AppState>, Json(json): Json<TuningJson>)
     }
 }
 
-async fn frame_png(State(state): State<AppState>) -> Response {
-    let png = encode_png(&state.output.borrow());
-    ([(header::CONTENT_TYPE, "image/png")], png).into_response()
+/// Every frame the panel is sent, as the parts of a
+/// `multipart/x-mixed-replace` response, which an `<img>` shows as they
+/// arrive.
+async fn frame_stream(State(state): State<AppState>) -> Response {
+    let mut output = state.output.clone();
+    output.mark_changed();
+    let frames = stream::unfold(output, |mut output| async move {
+        output.changed().await.ok()?;
+        let frame = Arc::clone(&output.borrow_and_update());
+        Some((Ok::<_, Infallible>(stream_part(&encode_png(&frame))), output))
+    });
+    let opening = stream::once(async { Ok(Bytes::from(format!("--{STREAM_BOUNDARY}\r\n"))) });
+    (
+        [(
+            header::CONTENT_TYPE,
+            format!("multipart/x-mixed-replace; boundary={STREAM_BOUNDARY}"),
+        )],
+        Body::from_stream(opening.chain(frames)),
+    )
+        .into_response()
+}
+
+/// One PNG part, closed by the boundary that opens the next: browsers show a
+/// part only once they see the boundary after it, so leaving it for the next
+/// frame would keep the preview a frame behind.
+fn stream_part(png: &[u8]) -> Bytes {
+    let mut part = format!(
+        "Content-Type: image/png\r\nContent-Length: {}\r\n\r\n",
+        png.len()
+    )
+    .into_bytes();
+    part.extend_from_slice(png);
+    part.extend_from_slice(format!("\r\n--{STREAM_BOUNDARY}\r\n").as_bytes());
+    Bytes::from(part)
 }
 
 async fn list_presets(State(state): State<AppState>) -> Json<Vec<String>> {
@@ -214,6 +249,15 @@ fn encode_png(frame: &Frame) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stream_parts_end_with_the_next_boundary() {
+        let part = stream_part(b"png");
+        assert_eq!(
+            &part[..],
+            b"Content-Type: image/png\r\nContent-Length: 3\r\n\r\npng\r\n--frame\r\n"
+        );
+    }
 
     #[test]
     fn tuning_round_trips_through_json() {
