@@ -1,10 +1,7 @@
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use album_art_core::protocol::{Brightness, PANEL_BITS, PanelFrame, SIZE};
+use album_art_core::protocol::{Brightness, PANEL_BITS, PanelColor, SIZE, Target};
 use embassy_executor::Spawner;
-use embassy_futures::select::{Either, select};
-use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Instant, Timer};
 use embedded_graphics::geometry::Point;
 use esp_hal::peripherals::{DMA_I2S0, I2S0};
@@ -28,23 +25,60 @@ const _: () = assert!(REFRESH_HZ >= 120);
 
 const STATS_INTERVAL: Duration = Duration::from_secs(5);
 
-static FRAME: Signal<CriticalSectionRawMutex, PanelFrame> = Signal::new();
-static BRIGHTNESS: Signal<CriticalSectionRawMutex, Brightness> = Signal::new();
-
-// A frame that arrives while another is pending replaces it, so received and
-// drawn diverge when the panel cannot keep up
-static RECEIVED: AtomicU32 = AtomicU32::new(0);
-static DRAWN: AtomicU32 = AtomicU32::new(0);
-static RENDER_MICROS: AtomicU32 = AtomicU32::new(0);
+static SHOWN: AtomicU32 = AtomicU32::new(0);
 static SWAP_MICROS: AtomicU32 = AtomicU32::new(0);
 
-pub fn show(frame: PanelFrame) {
-    RECEIVED.fetch_add(1, Ordering::Relaxed);
-    FRAME.signal(frame);
+/// The panel as a destination for decoded frames: pixels go straight into
+/// the back buffer, and [`Panel::present`] swaps it onto the panel.
+pub struct Panel {
+    hub75: Hub75<esp_hal::Async, FrameBuffer>,
+    /// `None` only while a swap is in flight.
+    back: Option<&'static mut FrameBuffer>,
+    brightness: Brightness,
 }
 
-pub fn set_brightness(brightness: Brightness) {
-    BRIGHTNESS.signal(brightness);
+impl Panel {
+    /// Shows the frame written into the back buffer, once the DMA has moved
+    /// over to it. Every frame writes every pixel, so the buffer coming back
+    /// needs no erasing before the next one.
+    pub async fn present(&mut self) {
+        let back = self.back.take().expect("present is not re-entered");
+        back.set_brightness(self.brightness.duty());
+        let swap_start = Instant::now();
+        let mut swap = self.hub75.swap(back).expect("only the panel swaps buffers");
+        swap.wait_for_done().await;
+        self.back = Some(swap.wait().expect("DMA keeps running across swaps"));
+        SHOWN.fetch_add(1, Ordering::Relaxed);
+        SWAP_MICROS.fetch_add(
+            (Instant::now() - swap_start).as_micros() as u32,
+            Ordering::Relaxed,
+        );
+    }
+}
+
+impl Target for Panel {
+    fn pixel(&mut self, x: usize, y: usize, color: PanelColor) {
+        // The framebuffer takes 8-bit channels and shows their top bits
+        let shift = 8 - PANEL_BITS;
+        self.back
+            .as_mut()
+            .expect("pixels only arrive between swaps")
+            .set_pixel(
+                Point::new(x as i32, y as i32),
+                Color::new(
+                    color.r.value() << shift,
+                    color.g.value() << shift,
+                    color.b.value() << shift,
+                ),
+            );
+    }
+
+    /// Takes effect with the next frame; the server re-sends the current one
+    /// after a brightness change.
+    fn brightness(&mut self, brightness: Brightness) {
+        self.brightness = brightness;
+        info!("Display: brightness {}%", brightness.percent());
+    }
 }
 
 pub fn start(
@@ -52,7 +86,7 @@ pub fn start(
     i2s: I2S0<'static>,
     dma: DMA_I2S0<'static>,
     pins: Hub75Pins16<'static>,
-) {
+) -> Panel {
     // Each buffer is larger than the main stack, so constructing one at
     // runtime would overflow it; zeroed statics formatted in place also keep
     // a formatted copy of both out of the firmware image
@@ -74,8 +108,13 @@ pub fn start(
     .expect("HUB75 driver starts");
     info!("Display: refreshing at {REFRESH_HZ} Hz");
 
-    spawner.spawn(display_task(hub75, back).expect("display task is spawned once"));
     spawner.spawn(stats_task().expect("stats task is spawned once"));
+    Panel {
+        hub75,
+        back: Some(back),
+        // The server sends brightness first; until then nothing is lit
+        brightness: Brightness::OFF,
+    }
 }
 
 /// Logs throughput while frames are arriving, and stays quiet otherwise.
@@ -83,66 +122,15 @@ pub fn start(
 async fn stats_task() {
     loop {
         Timer::after(STATS_INTERVAL).await;
-        let received = RECEIVED.swap(0, Ordering::Relaxed);
-        let drawn = DRAWN.swap(0, Ordering::Relaxed);
-        let render = RENDER_MICROS.swap(0, Ordering::Relaxed);
+        let shown = SHOWN.swap(0, Ordering::Relaxed);
         let swap = SWAP_MICROS.swap(0, Ordering::Relaxed);
-        if received == 0 {
+        if shown == 0 {
             continue;
         }
-        let per_draw = |micros: u32| micros / drawn.max(1);
         info!(
-            "Display: {received} frames received, {drawn} drawn in {}s; per draw {}us rendering, {}us waiting for the swap",
+            "Display: {shown} frames shown in {}s; {}us waiting for the swap per frame",
             STATS_INTERVAL.as_secs(),
-            per_draw(render),
-            per_draw(swap),
+            swap / shown,
         );
-    }
-}
-
-#[embassy_executor::task]
-async fn display_task(
-    hub75: Hub75<esp_hal::Async, FrameBuffer>,
-    mut back: &'static mut FrameBuffer,
-) {
-    let mut frame = PanelFrame::black();
-    // The server sends brightness first; until then nothing is lit
-    let mut brightness = Brightness::OFF;
-    loop {
-        match select(FRAME.wait(), BRIGHTNESS.wait()).await {
-            Either::First(next) => frame = next,
-            Either::Second(next) => {
-                brightness = next;
-                info!("Display: brightness {}%", brightness.percent());
-            }
-        }
-        let render_start = Instant::now();
-        back.erase();
-        // The framebuffer takes 8-bit channels and shows their top bits
-        let shift = 8 - PANEL_BITS;
-        for (y, row) in frame.pixels.iter().enumerate() {
-            for (x, color) in row.iter().enumerate() {
-                back.set_pixel(
-                    Point::new(x as i32, y as i32),
-                    Color::new(
-                        color.r.value() << shift,
-                        color.g.value() << shift,
-                        color.b.value() << shift,
-                    ),
-                );
-            }
-        }
-        back.set_brightness(brightness.duty());
-        let swap_start = Instant::now();
-        let mut swap = hub75.swap(back).expect("only this task swaps buffers");
-        swap.wait_for_done().await;
-        back = swap.wait().expect("DMA keeps running across swaps");
-        let swapped = Instant::now();
-        DRAWN.fetch_add(1, Ordering::Relaxed);
-        RENDER_MICROS.fetch_add(
-            (swap_start - render_start).as_micros() as u32,
-            Ordering::Relaxed,
-        );
-        SWAP_MICROS.fetch_add((swapped - swap_start).as_micros() as u32, Ordering::Relaxed);
     }
 }

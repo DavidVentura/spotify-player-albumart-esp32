@@ -60,30 +60,6 @@ impl PanelFrame {
             .expect("SIZE rows were allocated");
         PanelFrame { pixels }
     }
-
-    /// `levels` holds `SIZE * SIZE` row-major RGB triplets.
-    fn decode(levels: &[u8]) -> Result<Self, ProtocolError> {
-        let level = |byte: u8| Level::new(byte).ok_or(ProtocolError::LevelOutOfRange(byte));
-        let rows = levels
-            .chunks_exact(SIZE * 3)
-            .map(|row| {
-                let mut colors = [PanelColor::default(); SIZE];
-                for (color, rgb) in colors.iter_mut().zip(row.chunks_exact(3)) {
-                    *color = PanelColor {
-                        r: level(rgb[0])?,
-                        g: level(rgb[1])?,
-                        b: level(rgb[2])?,
-                    };
-                }
-                Ok(colors)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let pixels = rows
-            .into_boxed_slice()
-            .try_into()
-            .expect("FRAME_LEN bytes hold exactly SIZE rows");
-        Ok(PanelFrame { pixels })
-    }
 }
 
 /// Panel brightness as a percentage of full output.
@@ -147,56 +123,136 @@ pub enum ProtocolError {
     InvalidBrightness(u8),
 }
 
-/// Reassembles messages from a byte stream.
+/// Where decoded content goes. Pixels arrive one at a time as their bytes
+/// do, so a frame can be written straight into its destination.
+pub trait Target {
+    fn pixel(&mut self, x: usize, y: usize, color: PanelColor);
+    fn brightness(&mut self, brightness: Brightness);
+}
+
+/// How far one call to [`StreamDecoder::feed`] got.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Progress {
+    pub consumed: usize,
+    /// The last pixel of a frame was just delivered. Decoding stops right
+    /// there, so pixels of the next frame cannot reach the target before
+    /// the caller has shown this one.
+    pub frame_complete: bool,
+}
+
+/// Decodes the stream incrementally, without buffering whole messages.
 #[derive(Default)]
-pub struct MessageReader {
-    pending: Vec<u8>,
+pub struct StreamDecoder {
+    state: DecodeState,
+    header: HeaderBuffer,
 }
 
-impl MessageReader {
-    /// Returns the messages completed by `data`. An error means the stream is
-    /// out of sync and the connection should be dropped.
-    pub fn feed(&mut self, data: &[u8]) -> Result<Vec<Message>, ProtocolError> {
-        self.pending.extend_from_slice(data);
-        let mut messages = Vec::new();
+#[derive(Default)]
+enum DecodeState {
+    #[default]
+    Header,
+    Frame {
+        /// Payload bytes of this frame consumed so far.
+        offset: usize,
+        /// The current pixel's channels received so far.
+        channels: [u8; 3],
+    },
+    Brightness,
+}
+
+impl StreamDecoder {
+    /// Feeds `data`; call again with the unconsumed rest. An error means the
+    /// stream is out of sync and the connection should be dropped.
+    pub fn feed(
+        &mut self,
+        data: &[u8],
+        target: &mut impl Target,
+    ) -> Result<Progress, ProtocolError> {
         let mut consumed = 0;
-        while let Some((message, len)) = decode(&self.pending[consumed..])? {
-            messages.push(message);
-            consumed += len;
+        while consumed < data.len() {
+            match &mut self.state {
+                DecodeState::Header => {
+                    consumed += self.header.fill(&data[consumed..]);
+                    let Some((kind, len)) = self.header.take() else {
+                        continue;
+                    };
+                    self.state = match (kind, len) {
+                        (KIND_FRAME, FRAME_LEN) => DecodeState::Frame {
+                            offset: 0,
+                            channels: [0; 3],
+                        },
+                        (KIND_BRIGHTNESS, BRIGHTNESS_LEN) => DecodeState::Brightness,
+                        (KIND_FRAME | KIND_BRIGHTNESS, len) => {
+                            return Err(ProtocolError::WrongLength { kind, len });
+                        }
+                        (kind, _) => return Err(ProtocolError::UnknownKind(kind)),
+                    };
+                }
+                DecodeState::Brightness => {
+                    let percent = data[consumed];
+                    consumed += 1;
+                    let brightness = Brightness::new(percent)
+                        .ok_or(ProtocolError::InvalidBrightness(percent))?;
+                    target.brightness(brightness);
+                    self.state = DecodeState::Header;
+                }
+                DecodeState::Frame { offset, channels } => {
+                    let byte = data[consumed];
+                    consumed += 1;
+                    channels[*offset % 3] = byte;
+                    *offset += 1;
+                    if *offset % 3 != 0 {
+                        continue;
+                    }
+                    let level =
+                        |byte: u8| Level::new(byte).ok_or(ProtocolError::LevelOutOfRange(byte));
+                    let pixel = *offset / 3 - 1;
+                    let color = PanelColor {
+                        r: level(channels[0])?,
+                        g: level(channels[1])?,
+                        b: level(channels[2])?,
+                    };
+                    target.pixel(pixel % SIZE, pixel / SIZE, color);
+                    if *offset == FRAME_LEN {
+                        self.state = DecodeState::Header;
+                        return Ok(Progress {
+                            consumed,
+                            frame_complete: true,
+                        });
+                    }
+                }
+            }
         }
-        self.pending.drain(..consumed);
-        Ok(messages)
+        Ok(Progress {
+            consumed,
+            frame_complete: false,
+        })
     }
 }
 
-/// Decodes the first message in `data`, returning it with its encoded length,
-/// or `None` if `data` does not hold a whole message yet.
-fn decode(data: &[u8]) -> Result<Option<(Message, usize)>, ProtocolError> {
-    let Some(header) = data.get(..HEADER_LEN) else {
-        return Ok(None);
-    };
-    let kind = header[0];
-    let len = u32::from_le_bytes(header[1..].try_into().expect("4 length bytes")) as usize;
-    let expected = match kind {
-        KIND_FRAME => FRAME_LEN,
-        KIND_BRIGHTNESS => BRIGHTNESS_LEN,
-        _ => return Err(ProtocolError::UnknownKind(kind)),
-    };
-    // Checked before waiting for the payload, so a corrupt length cannot make
-    // the reader buffer an unbounded amount
-    if len != expected {
-        return Err(ProtocolError::WrongLength { kind, len });
+/// A message header that may arrive split across reads.
+#[derive(Default)]
+struct HeaderBuffer {
+    bytes: [u8; HEADER_LEN],
+    filled: usize,
+}
+
+impl HeaderBuffer {
+    fn fill(&mut self, data: &[u8]) -> usize {
+        let taken = data.len().min(HEADER_LEN - self.filled);
+        self.bytes[self.filled..self.filled + taken].copy_from_slice(&data[..taken]);
+        self.filled += taken;
+        taken
     }
-    let Some(payload) = data.get(HEADER_LEN..HEADER_LEN + len) else {
-        return Ok(None);
-    };
-    let message = match kind {
-        KIND_FRAME => Message::Frame(PanelFrame::decode(payload)?),
-        _ => Message::Brightness(
-            Brightness::new(payload[0]).ok_or(ProtocolError::InvalidBrightness(payload[0]))?,
-        ),
-    };
-    Ok(Some((message, HEADER_LEN + len)))
+
+    fn take(&mut self) -> Option<(u8, usize)> {
+        if self.filled < HEADER_LEN {
+            return None;
+        }
+        self.filled = 0;
+        let len = u32::from_le_bytes(self.bytes[1..].try_into().expect("4 length bytes"));
+        Some((self.bytes[0], len as usize))
+    }
 }
 
 #[cfg(test)]
@@ -222,16 +278,87 @@ mod tests {
         Brightness::new(35).unwrap()
     }
 
+    /// Rebuilds whole messages from what the decoder delivers.
+    struct Collect {
+        frame: PanelFrame,
+        decoded: Vec<Message>,
+    }
+
+    impl Collect {
+        fn new() -> Self {
+            Collect {
+                frame: PanelFrame::black(),
+                decoded: Vec::new(),
+            }
+        }
+
+        /// Feeds `data` the way a caller does, finishing a frame whenever
+        /// the decoder reports one.
+        fn feed(
+            &mut self,
+            decoder: &mut StreamDecoder,
+            mut data: &[u8],
+        ) -> Result<(), ProtocolError> {
+            while !data.is_empty() {
+                let progress = decoder.feed(data, self)?;
+                if progress.frame_complete {
+                    self.decoded.push(Message::Frame(self.frame.clone()));
+                }
+                data = &data[progress.consumed..];
+            }
+            Ok(())
+        }
+    }
+
+    impl Target for Collect {
+        fn pixel(&mut self, x: usize, y: usize, color: PanelColor) {
+            self.frame.pixels[y][x] = color;
+        }
+
+        fn brightness(&mut self, brightness: Brightness) {
+            self.decoded.push(Message::Brightness(brightness));
+        }
+    }
+
+    fn decode(stream: &[u8]) -> Result<Vec<Message>, ProtocolError> {
+        let mut decoder = StreamDecoder::default();
+        let mut collect = Collect::new();
+        collect.feed(&mut decoder, stream)?;
+        Ok(collect.decoded)
+    }
+
     #[test]
     fn round_trips_messages_split_at_every_byte() {
-        let messages = vec![Message::Brightness(brightness()), Message::Frame(gradient())];
+        let messages = vec![
+            Message::Brightness(brightness()),
+            Message::Frame(gradient()),
+            Message::Frame(PanelFrame::black()),
+        ];
         let stream: Vec<u8> = messages.iter().flat_map(Message::encode).collect();
         for cut in 0..stream.len() {
-            let mut reader = MessageReader::default();
-            let mut decoded = reader.feed(&stream[..cut]).unwrap();
-            decoded.extend(reader.feed(&stream[cut..]).unwrap());
-            assert_eq!(decoded, messages, "split at {cut}");
+            let mut decoder = StreamDecoder::default();
+            let mut collect = Collect::new();
+            collect.feed(&mut decoder, &stream[..cut]).unwrap();
+            collect.feed(&mut decoder, &stream[cut..]).unwrap();
+            assert_eq!(collect.decoded, messages, "split at {cut}");
         }
+    }
+
+    #[test]
+    fn stops_right_after_a_frame() {
+        let mut stream = Message::Frame(gradient()).encode();
+        let frame_len = stream.len();
+        stream.extend(Message::Frame(PanelFrame::black()).encode());
+        let mut decoder = StreamDecoder::default();
+        let mut collect = Collect::new();
+        assert_eq!(
+            decoder.feed(&stream, &mut collect),
+            Ok(Progress {
+                consumed: frame_len,
+                frame_complete: true,
+            })
+        );
+        assert_eq!(collect.frame, gradient());
     }
 
     #[test]
@@ -261,36 +388,26 @@ mod tests {
     fn rejects_levels_beyond_the_panel_depth() {
         let mut encoded = Message::Frame(PanelFrame::black()).encode();
         encoded[HEADER_LEN + 7] = 64;
-        let mut reader = MessageReader::default();
-        assert_eq!(
-            reader.feed(&encoded),
-            Err(ProtocolError::LevelOutOfRange(64))
-        );
+        assert_eq!(decode(&encoded), Err(ProtocolError::LevelOutOfRange(64)));
     }
 
     #[test]
     fn rejects_unknown_kind() {
-        let mut reader = MessageReader::default();
-        assert_eq!(
-            reader.feed(&[9, 0, 0, 0, 0]),
-            Err(ProtocolError::UnknownKind(9))
-        );
+        assert_eq!(decode(&[9, 0, 0, 0, 0]), Err(ProtocolError::UnknownKind(9)));
     }
 
     #[test]
     fn rejects_the_rgb888_protocol() {
-        let mut reader = MessageReader::default();
         assert_eq!(
-            reader.feed(&[1, 0x00, 0x30, 0, 0]),
+            decode(&[1, 0x00, 0x30, 0, 0]),
             Err(ProtocolError::UnknownKind(1))
         );
     }
 
     #[test]
-    fn rejects_wrong_length_before_buffering_payload() {
-        let mut reader = MessageReader::default();
+    fn rejects_wrong_length_before_reading_the_payload() {
         assert_eq!(
-            reader.feed(&[3, 0xff, 0xff, 0xff, 0x7f]),
+            decode(&[3, 0xff, 0xff, 0xff, 0x7f]),
             Err(ProtocolError::WrongLength {
                 kind: 3,
                 len: 0x7fff_ffff
@@ -300,9 +417,8 @@ mod tests {
 
     #[test]
     fn rejects_out_of_range_brightness() {
-        let mut reader = MessageReader::default();
         assert_eq!(
-            reader.feed(&[4, 1, 0, 0, 0, 101]),
+            decode(&[4, 1, 0, 0, 0, 101]),
             Err(ProtocolError::InvalidBrightness(101))
         );
     }

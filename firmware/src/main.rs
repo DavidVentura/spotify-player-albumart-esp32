@@ -51,7 +51,7 @@ async fn main(spawner: Spawner) {
         (u64::from(trng.random()) << 32) | u64::from(trng.random())
     };
 
-    display::start(
+    let panel = display::start(
         spawner,
         peripherals.I2S0,
         peripherals.DMA_I2S0,
@@ -74,7 +74,7 @@ async fn main(spawner: Spawner) {
     );
 
     let stack = wifi::connect(spawner, peripherals.WIFI, seed).await;
-    spawner.spawn(link::run(stack, server).expect("link task is spawned once"));
+    spawner.spawn(link::run(stack, server, panel).expect("link task is spawned once"));
     spawner.spawn(health().expect("health task is spawned once"));
 }
 

@@ -14,6 +14,10 @@ use crate::color::{ColorCorrection, Tuning};
 use crate::frame::Frame;
 
 const STATS_INTERVAL: Duration = Duration::from_secs(5);
+/// Bytes the kernel may hold unsent before writes block. Small, so frames
+/// that pile up while the panel is busy are replaced in the `watch` instead of
+/// queueing in the socket and playing back late.
+const UNSENT_LIMIT: u32 = 1024;
 
 pub async fn serve(
     address: SocketAddr,
@@ -38,8 +42,9 @@ pub async fn serve(
 
 /// Sends the current state, then every change. A `watch` only holds the
 /// newest value, so a slow panel skips stale frames instead of falling
-/// behind. Colour settings are applied here, so changing them re-sends the
-/// frame on screen; brightness is the panel's own and goes over as is.
+/// behind. Colour settings are applied here; brightness is applied by the
+/// panel as it shows a frame, and it keeps no copy to redraw from, so any
+/// tuning change re-sends the frame on screen.
 async fn push(
     mut stream: TcpStream,
     peer: SocketAddr,
@@ -47,6 +52,7 @@ async fn push(
     mut tuning: watch::Receiver<Tuning>,
 ) -> std::io::Result<()> {
     stream.set_nodelay(true)?;
+    socket2::SockRef::from(&stream).set_tcp_notsent_lowat(UNSENT_LIMIT)?;
     let mut current = *tuning.borrow_and_update();
     let mut correction = ColorCorrection::new(current.gamma, current.white_balance);
     stream
@@ -67,6 +73,7 @@ async fn push(
                 current = next;
                 if let Some(brightness) = change.brightness {
                     stream.write_all(&Message::Brightness(brightness).encode()).await?;
+                    frames.mark_changed();
                 }
                 if change.colour {
                     correction = ColorCorrection::new(current.gamma, current.white_balance);
@@ -96,7 +103,7 @@ async fn push(
 #[derive(Debug, PartialEq, Eq)]
 struct TuningChange {
     brightness: Option<Brightness>,
-    /// Gamma or white balance changed, so the frame must be corrected again.
+    /// Gamma or white balance changed, so the correction must be rebuilt.
     colour: bool,
 }
 
@@ -115,7 +122,7 @@ mod tests {
     use crate::color::{GammaExponent, WhiteBalance};
 
     #[test]
-    fn brightness_alone_does_not_resend_the_frame() {
+    fn brightness_alone_keeps_the_colour_correction() {
         let dimmer = Tuning {
             brightness: Brightness::new(5).unwrap(),
             ..Tuning::DEFAULT
