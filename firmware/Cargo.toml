@@ -22,7 +22,8 @@ esp-alloc = { version = "0.11", features = ["esp32"] }
 esp-backtrace = { version = "0.20", features = ["esp32", "panic-handler", "println"] }
 esp-bootloader-esp-idf = { version = "0.6", features = ["esp32", "log-04"] }
 esp-hal = { version = "~1.2.2", features = ["esp32", "unstable", "log-04"] }
-esp-hub75 = { version = "0.17", features = ["esp32", "ring-swap", "iram", "log"] }
+# Row drivers switch off slowly; without blanking after each address change every row showed a faint copy of the next one scanned
+esp-hub75 = { version = "0.17", features = ["esp32", "ring-swap", "iram", "log", "trail-blank-4"] }
 esp-metadata-generated = { version = "0.5", features = ["esp32"] }
 esp-println = { version = "0.18", features = ["esp32", "log-04"] }
 esp-radio = { version = "=1.0.0-beta.1", features = ["esp32", "wifi", "unstable", "log-04"] }
