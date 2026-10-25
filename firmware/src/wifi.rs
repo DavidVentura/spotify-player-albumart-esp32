@@ -1,6 +1,6 @@
 use embassy_executor::Spawner;
 use embassy_net::{Runner, Stack, StackResources};
-use embassy_time::{Duration, Timer};
+use embassy_time::{Duration, TimeoutError, Timer, with_timeout};
 use esp_hal::peripherals::WIFI;
 use esp_radio::wifi::sta::StationConfig;
 use esp_radio::wifi::{
@@ -14,6 +14,7 @@ use crate::config::{WIFI_PASSWORD, WIFI_SSID};
 /// DHCP and the server connection.
 const SOCKETS: usize = 2;
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
+const SIGNAL_LOG_INTERVAL: Duration = Duration::from_secs(5);
 /// Replies to a weak station get lost now and then, and smoltcp's defaults
 /// (10s, 5s) make each loss a long stall. It must stay above the server's
 /// ping check (ISC dhcpd waits 1s before offering), or every retry would
@@ -69,7 +70,17 @@ async fn connection_task(mut controller: WifiController<'static>) {
         match controller.connect_async().await {
             Ok(connected) => {
                 info!("WiFi: connected {connected:?}");
-                let disconnected = controller.wait_for_disconnect_async().await;
+                let disconnected = loop {
+                    match with_timeout(SIGNAL_LOG_INTERVAL, controller.wait_for_disconnect_async())
+                        .await
+                    {
+                        Ok(disconnected) => break disconnected,
+                        Err(TimeoutError) => match controller.rssi() {
+                            Ok(rssi) => info!("WiFi: access point heard at {rssi} dBm"),
+                            Err(e) => error!("WiFi: reading signal strength: {e:?}"),
+                        },
+                    }
+                };
                 error!("WiFi: disconnected {disconnected:?}");
             }
             Err(e) => error!("WiFi: failed to connect: {e:?}"),
