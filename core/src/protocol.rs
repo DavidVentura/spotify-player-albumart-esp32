@@ -1,8 +1,11 @@
 //! Server-to-panel stream: a sequence of `[kind: u8][length: u32 LE][payload]`
-//! messages over one TCP connection.
+//! messages over one TCP connection, answered by panel [`Report`]s framed the
+//! same way.
 //!
 //! The server does all colour work; the panel receives the exact levels to
-//! drive and only scales them by brightness.
+//! drive and only scales them by brightness. Dimming can cost the panel its
+//! lowest bits, so it reports the [`Depth`] each brightness leaves it, and the
+//! server picks colours among the levels it can still show.
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -16,9 +19,13 @@ pub const PANEL_BITS: u32 = 8;
 // rejects this stream instead of misreading it
 const KIND_FRAME: u8 = 5;
 const KIND_BRIGHTNESS: u8 = 4;
+const KIND_DEPTH: u8 = 6;
 const HEADER_LEN: usize = 5;
 const FRAME_LEN: usize = SIZE * SIZE * 3;
 const BRIGHTNESS_LEN: usize = 1;
+const DEPTH_LEN: usize = 1;
+/// Every report is this long.
+pub const REPORT_LEN: usize = HEADER_LEN + DEPTH_LEN;
 
 /// One channel's drive level, `0..=Level::MAX`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
@@ -88,6 +95,70 @@ impl Brightness {
     }
 }
 
+/// How many of a level's top bits the panel shows; dimming drops the lowest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Depth(u8);
+
+impl Depth {
+    pub const FULL: Depth = Depth(PANEL_BITS as u8);
+
+    pub const fn new(bits: u8) -> Option<Self> {
+        if bits as u32 > PANEL_BITS {
+            return None;
+        }
+        Some(Depth(bits))
+    }
+
+    pub fn bits(self) -> u8 {
+        self.0
+    }
+
+    /// The levels shown are the multiples of this.
+    pub fn step(self) -> u16 {
+        1 << (PANEL_BITS - u32::from(self.0))
+    }
+
+    /// The brightest level shown, `0` when nothing lights.
+    pub fn max_level(self) -> Level {
+        Level((256 - self.step()) as u8)
+    }
+}
+
+/// What the panel tells the server.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Report {
+    /// Sent after every brightness change.
+    Depth(Depth),
+}
+
+impl Report {
+    pub fn encode(self) -> [u8; REPORT_LEN] {
+        let Report::Depth(depth) = self;
+        let mut encoded = [0; REPORT_LEN];
+        encoded[0] = KIND_DEPTH;
+        encoded[1..HEADER_LEN].copy_from_slice(&(DEPTH_LEN as u32).to_le_bytes());
+        encoded[HEADER_LEN] = depth.0;
+        encoded
+    }
+
+    pub fn decode(bytes: [u8; REPORT_LEN]) -> Result<Report, ProtocolError> {
+        let kind = bytes[0];
+        let len = u32::from_le_bytes(bytes[1..HEADER_LEN].try_into().expect("4 length bytes"));
+        if kind != KIND_DEPTH {
+            return Err(ProtocolError::UnknownKind(kind));
+        }
+        if len as usize != DEPTH_LEN {
+            return Err(ProtocolError::WrongLength {
+                kind,
+                len: len as usize,
+            });
+        }
+        let bits = bytes[HEADER_LEN];
+        let depth = Depth::new(bits).ok_or(ProtocolError::InvalidDepth(bits))?;
+        Ok(Report::Depth(depth))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Message {
     Frame(PanelFrame),
@@ -122,6 +193,7 @@ pub enum ProtocolError {
     UnknownKind(u8),
     WrongLength { kind: u8, len: usize },
     InvalidBrightness(u8),
+    InvalidDepth(u8),
 }
 
 /// Where decoded content goes. Pixels arrive one at a time as their bytes
@@ -375,6 +447,40 @@ mod tests {
         // pixel (x=2, y=1)
         let offset = HEADER_LEN + (SIZE + 2) * 3;
         assert_eq!(&encoded[offset..offset + 3], &[2, 1, 1]);
+    }
+
+    #[test]
+    fn depth_report_round_trips() {
+        for bits in 0..=8 {
+            let report = Report::Depth(Depth::new(bits).unwrap());
+            assert_eq!(Report::decode(report.encode()), Ok(report));
+        }
+    }
+
+    #[test]
+    fn rejects_depth_beyond_the_panel() {
+        let mut encoded = Report::Depth(Depth::FULL).encode();
+        encoded[HEADER_LEN] = 9;
+        assert_eq!(Report::decode(encoded), Err(ProtocolError::InvalidDepth(9)));
+    }
+
+    #[test]
+    fn rejects_reports_of_another_kind() {
+        let mut encoded = Report::Depth(Depth::FULL).encode();
+        encoded[0] = KIND_BRIGHTNESS;
+        assert_eq!(
+            Report::decode(encoded),
+            Err(ProtocolError::UnknownKind(KIND_BRIGHTNESS))
+        );
+    }
+
+    #[test]
+    fn depth_keeps_the_top_bits() {
+        let five = Depth::new(5).unwrap();
+        assert_eq!(five.step(), 8);
+        assert_eq!(five.max_level(), Level::new(248));
+        assert_eq!(Depth::FULL.max_level(), Level::MAX);
+        assert_eq!(Depth::new(0).unwrap().max_level(), Level::new(0));
     }
 
     #[test]

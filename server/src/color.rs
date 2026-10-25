@@ -1,6 +1,6 @@
 use std::ops::RangeInclusive;
 
-use album_art_core::protocol::{Brightness, Level, PanelColor, PanelFrame};
+use album_art_core::protocol::{Brightness, Depth, Level, PanelColor, PanelFrame};
 
 use crate::frame::Frame;
 
@@ -105,31 +105,31 @@ impl ColorCorrection {
         }
     }
 
-    pub fn apply(&self, frame: &Frame) -> PanelFrame {
+    /// Levels for `frame`, among those the panel shows at `depth`.
+    pub fn apply(&self, frame: &Frame, depth: Depth) -> PanelFrame {
         let mut panel = PanelFrame::black();
         for (panel_row, row) in panel.pixels.iter_mut().zip(frame.pixels.iter()) {
             for (panel_color, &color) in panel_row.iter_mut().zip(row) {
-                *panel_color = self.quantize(color);
+                *panel_color = self.quantize(color, depth);
             }
         }
         panel
     }
 
-    /// Picks, among rounding each channel down or up, the combination
-    /// closest to the wanted light in CIELAB, where distance follows how
-    /// different colours look.
-    fn quantize(&self, color: Rgb) -> PanelColor {
+    /// Picks, among rounding each channel down or up to a level shown at
+    /// `depth`, the combination closest to the wanted light in CIELAB, where
+    /// distance follows how different colours look.
+    fn quantize(&self, color: Rgb, depth: Depth) -> PanelColor {
         let max = f32::from(Level::MAX.value());
+        let step = depth.step();
+        let top = u16::from(depth.max_level().value());
         let values = [color.r, color.g, color.b];
         let wanted: [f32; 3] =
             std::array::from_fn(|channel| self.linear[channel][usize::from(values[channel])]);
         let target = lab(wanted);
         let bounds = wanted.map(|light| {
-            let scaled = light * max;
-            (
-                scaled.floor() as u8,
-                (scaled.ceil() as u8).min(Level::MAX.value()),
-            )
+            let down = ((light * max / f32::from(step)).floor() as u16 * step).min(top);
+            (down as u8, (down + step).min(top) as u8)
         });
         let (_, best) = (0..8u8)
             .map(|choice| {
@@ -193,6 +193,12 @@ mod tests {
         }
     }
 
+    impl ColorCorrection {
+        fn quantize_full(&self, color: Rgb) -> PanelColor {
+            self.quantize(color, Depth::FULL)
+        }
+    }
+
     fn levels(color: PanelColor) -> [u8; 3] {
         [color.r.value(), color.g.value(), color.b.value()]
     }
@@ -204,23 +210,23 @@ mod tests {
     #[test]
     fn keeps_black_and_white_at_the_ends_of_the_scale() {
         let correction = neutral(220);
-        assert_eq!(levels(correction.quantize(grey(0))), [0, 0, 0]);
-        assert_eq!(levels(correction.quantize(grey(255))), [255, 255, 255]);
+        assert_eq!(levels(correction.quantize_full(grey(0))), [0, 0, 0]);
+        assert_eq!(levels(correction.quantize_full(grey(255))), [255, 255, 255]);
     }
 
     #[test]
     fn rounds_to_the_nearest_level_instead_of_truncating() {
         let correction = neutral(220);
         // sRGB 18 is 0.29% linear, three quarters of the lowest level
-        assert_eq!(levels(correction.quantize(grey(18))), [1, 1, 1]);
-        assert_eq!(levels(correction.quantize(grey(10))), [0, 0, 0]);
+        assert_eq!(levels(correction.quantize_full(grey(18))), [1, 1, 1]);
+        assert_eq!(levels(correction.quantize_full(grey(10))), [0, 0, 0]);
     }
 
     #[test]
     fn greys_stay_neutral() {
         let correction = neutral(235);
         for value in 0..=255 {
-            let [r, g, b] = levels(correction.quantize(grey(value)));
+            let [r, g, b] = levels(correction.quantize_full(grey(value)));
             assert!(r == g && g == b, "grey {value} became {r}/{g}/{b}");
         }
     }
@@ -238,17 +244,55 @@ mod tests {
                     g: (f32::from(value) * green_share).round() as u8,
                     b: (f32::from(value) * 0.19).round() as u8,
                 };
-                let [r, g, _] = levels(correction.quantize(yellow));
+                let [r, g, _] = levels(correction.quantize_full(yellow));
                 assert!(r <= 1 || g > 0, "{yellow:?} became red only: {r}/{g}");
             }
         }
     }
 
     #[test]
+    fn reduced_depth_uses_only_the_levels_shown() {
+        let correction = neutral(235);
+        for bits in 0..=8 {
+            let depth = Depth::new(bits).unwrap();
+            for value in 0..=255 {
+                let color = Rgb {
+                    r: value,
+                    g: value / 2,
+                    b: 255 - value,
+                };
+                for level in levels(correction.quantize(color, depth)) {
+                    assert_eq!(u16::from(level) % depth.step(), 0, "{bits} bits: {level}");
+                    assert!(level <= depth.max_level().value());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reduced_depth_keeps_greys_neutral() {
+        let correction = neutral(235);
+        let depth = Depth::new(4).unwrap();
+        for value in 0..=255 {
+            let [r, g, b] = levels(correction.quantize(grey(value), depth));
+            assert!(r == g && g == b, "grey {value} became {r}/{g}/{b}");
+        }
+    }
+
+    #[test]
+    fn reduced_depth_rounds_dim_light_up_when_closer() {
+        let correction = neutral(220);
+        let depth = Depth::new(5).unwrap();
+        // sRGB 52 is 3% linear, 7.6 of 255: nearer the lowest shown level (8)
+        // than black, where dropping the low bits on the panel would land
+        assert_eq!(levels(correction.quantize(grey(52), depth)), [8, 8, 8]);
+    }
+
+    #[test]
     fn white_balance_scales_each_channel() {
         let balance = WhiteBalance::new(100, 80, 50).unwrap();
         let correction = ColorCorrection::new(gamma(220), balance);
-        let [r, g, b] = levels(correction.quantize(grey(255)));
+        let [r, g, b] = levels(correction.quantize_full(grey(255)));
         assert_eq!((r, g), (255, 204));
         assert!((127..=128).contains(&b), "blue {b}");
     }
@@ -256,7 +300,7 @@ mod tests {
     #[test]
     fn linear_gamma_keeps_proportions() {
         let correction = neutral(100);
-        assert_eq!(levels(correction.quantize(grey(128))), [128, 128, 128]);
+        assert_eq!(levels(correction.quantize_full(grey(128))), [128, 128, 128]);
     }
 
     #[test]

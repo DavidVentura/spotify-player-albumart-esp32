@@ -1,6 +1,6 @@
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use album_art_core::protocol::{Brightness, PANEL_BITS, PanelColor, SIZE, Target};
+use album_art_core::protocol::{Brightness, Depth, PANEL_BITS, PanelColor, Report, SIZE, Target};
 use embassy_executor::Spawner;
 use embassy_time::{Duration, Instant, Timer};
 use embedded_graphics::geometry::Point;
@@ -37,6 +37,8 @@ pub struct Panel {
     /// `None` only while a swap is in flight.
     back: Option<&'static mut FrameBuffer>,
     brightness: Brightness,
+    /// The depth the latest brightness leaves, until the server is told.
+    unreported: Option<Depth>,
 }
 
 impl Panel {
@@ -55,6 +57,11 @@ impl Panel {
             (Instant::now() - swap_start).as_micros() as u32,
             Ordering::Relaxed,
         );
+    }
+
+    /// What the server should hear since the last call.
+    pub fn take_report(&mut self) -> Option<Report> {
+        self.unreported.take().map(Report::Depth)
     }
 }
 
@@ -75,8 +82,11 @@ impl Target for Panel {
         self.brightness = brightness;
         let back = self.back.as_mut().expect("brightness only arrives between swaps");
         back.set_brightness(brightness.duty(), MAX_ROW_CLOCKS);
+        let bits = back.lit_bits();
+        self.unreported =
+            Some(Depth::new(bits as u8).expect("the framebuffer has PANEL_BITS planes"));
         info!(
-            "Display: brightness {}%, refreshing at {} Hz",
+            "Display: brightness {}%, {bits} bits, refreshing at {} Hz",
             brightness.percent(),
             PIXEL_CLOCK.as_hz() as usize / (back.row_clocks() * NROWS),
         );
@@ -119,6 +129,7 @@ pub fn start(
         back: Some(back),
         // The server sends brightness first; until then nothing is lit
         brightness: Brightness::OFF,
+        unreported: None,
     }
 }
 

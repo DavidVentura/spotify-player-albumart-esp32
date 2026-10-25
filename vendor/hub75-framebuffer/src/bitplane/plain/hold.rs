@@ -8,10 +8,12 @@
 //! streaming a per-row run of lit words, so a row costs roughly
 //! `Σ max(COLS, weight)` clocks and 8 planes refresh at several hundred Hz.
 //!
-//! One row's segments, with `Sk` shifting plane `k` in and `Hk` holding it:
+//! One row's segments, with `Sk` shifting plane `k` in and `Hk` holding it.
+//! Planes short enough to need no hold have no `Hk`, and their shifts stream
+//! as one run:
 //!
 //! ```text
-//! S0 H0 S1 H1 … S(n-1) H(n-1) dark
+//! dark S0 H0 S1 H1 … S(n-1) H(n-1)
 //! ```
 //!
 //! `Sk` (`k ≥ 1`) lights plane `k − 1` in its output-enable window; `S0` keeps
@@ -104,7 +106,9 @@ const fn hold_reps<const COLS: usize, const PLANES: usize>() -> [usize; PLANES] 
 /// One DMA run in a row's sequence.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Segment {
-    Shift(usize),
+    /// Shifts of `count` consecutive planes from `first`, which lie back to
+    /// back in memory.
+    Shifts { first: usize, count: usize },
     Hold(usize),
     Dark,
 }
@@ -114,19 +118,30 @@ const fn layout<const COLS: usize, const PLANES: usize>(
 ) -> ([Segment; BCM_SEQUENCE_CAPACITY], usize) {
     let reps = hold_reps::<COLS, PLANES>();
     let mut segments = [Segment::Dark; BCM_SEQUENCE_CAPACITY];
-    let mut len = 0;
+    // The dark run opens the row, so the ring starts on blank words: the DMA
+    // raises its once-per-pass EOF at the ring's first descriptor, and words
+    // skewed there must not reach a shift or a latch
+    let mut len = 1;
+    let mut first = 0;
     let mut plane = 0;
+    // Shifts run on into the next plane's until a plane needs a hold, so a
+    // row streams as few DMA runs as possible
     while plane < PLANES {
-        segments[len] = Segment::Shift(plane);
-        len += 1;
-        if reps[plane] > 0 {
-            segments[len] = Segment::Hold(plane);
+        if reps[plane] > 0 || plane == PLANES - 1 {
+            segments[len] = Segment::Shifts {
+                first,
+                count: plane + 1 - first,
+            };
             len += 1;
+            if reps[plane] > 0 {
+                segments[len] = Segment::Hold(plane);
+                len += 1;
+            }
+            first = plane + 1;
         }
         plane += 1;
     }
-    // The dark run closes the row
-    (segments, len + 1)
+    (segments, len)
 }
 
 /// Hold and dark words for every row, shared by all framebuffers.
@@ -363,6 +378,16 @@ impl<const NROWS: usize, const COLS: usize, const PLANES: usize>
         self.timing.row_clocks::<COLS>()
     }
 
+    /// How many of a colour's top bits the current brightness lights: dim
+    /// settings drop the lowest planes once their on-time would fall below
+    /// one clock.
+    #[must_use]
+    pub fn lit_bits(&self) -> usize {
+        (0..PLANES)
+            .filter(|&plane| self.timing.window[plane] > 0 || self.timing.hold[plane] > 0)
+            .count()
+    }
+
     fn write_windows(&mut self) {
         let window = self.timing.window;
         for row in &mut self.rows {
@@ -435,8 +460,8 @@ const fn bcm_sequence<const COLS: usize, const PLANES: usize>(
         // Holds and dark runs at the longest they get; descriptors are sized
         // from these
         seq[i] = match segments[i] {
-            Segment::Shift(_) => BcmLenReps {
-                len: COLS * word,
+            Segment::Shifts { count, .. } => BcmLenReps {
+                len: count * COLS * word,
                 reps: 1,
             },
             Segment::Hold(plane) => BcmLenReps {
@@ -482,7 +507,7 @@ impl<const NROWS: usize, const COLS: usize, const PLANES: usize> FrameBuffer
         let reps = Self::BCM_SEQUENCE[position].reps;
         let hold_row = &self.holds().rows[slot];
         let (ptr, words): (*const Entry, usize) = match Self::LAYOUT[position] {
-            Segment::Shift(plane) => (self.rows[slot][plane].as_ptr(), COLS),
+            Segment::Shifts { first, count } => (self.rows[slot][first].as_ptr(), count * COLS),
             Segment::Hold(plane) => {
                 let hold = self.timing.hold[plane];
                 // Taken from the whole row, since a short hold runs on from
@@ -545,10 +570,10 @@ mod tests {
                         let plane = latched.unwrap_or(PLANES - 1);
                         lit[plane] += 1;
                     }
-                    if let (true, Segment::Shift(plane)) =
+                    if let (true, Segment::Shifts { first, .. }) =
                         (entry.latch(), TestBuffer::LAYOUT[position])
                     {
-                        latched = Some(plane);
+                        latched = Some(first + i / COLS);
                     }
                 }
             }
@@ -630,6 +655,25 @@ mod tests {
     fn dim_brightness_keeps_every_plane_down_to_one_clock() {
         let timing = Timing::<PLANES>::for_brightness::<COLS>(51, MAX_ROW);
         assert!(timing.window[0] >= 1, "{timing:?}");
+    }
+
+    #[test]
+    fn lit_bits_drop_from_the_bottom_as_it_dims() {
+        let mut fb = formatted();
+        fb.set_brightness(255, MAX_ROW);
+        assert_eq!(fb.lit_bits(), PLANES);
+        fb.set_brightness(0, MAX_ROW);
+        assert_eq!(fb.lit_bits(), 0);
+        let mut previous = PLANES;
+        for brightness in (1..=255u8).rev() {
+            fb.set_brightness(brightness, MAX_ROW);
+            let (lit, _) = lit_per_plane(&fb, 0);
+            let bits = fb.lit_bits();
+            assert!(bits <= previous && bits >= 1);
+            assert!(lit[..PLANES - bits].iter().all(|&clocks| clocks == 0));
+            assert!(lit[PLANES - bits..].iter().all(|&clocks| clocks > 0));
+            previous = bits;
+        }
     }
 
     #[test]

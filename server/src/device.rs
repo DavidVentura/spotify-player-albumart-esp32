@@ -4,9 +4,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use album_art_core::protocol::{Brightness, Message};
+use album_art_core::protocol::{Brightness, Depth, Message, REPORT_LEN, Report};
 use log::{info, warn};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 
@@ -43,27 +44,52 @@ pub async fn serve(
 /// Sends the current state, then every change. A `watch` only holds the
 /// newest value, so a slow panel skips stale frames instead of falling
 /// behind. Colour settings are applied here; brightness is applied by the
-/// panel as it shows a frame, and it keeps no copy to redraw from, so any
-/// tuning change re-sends the frame on screen.
+/// panel as it shows a frame, and it keeps no copy to redraw from. It
+/// answers every brightness with the depth that brightness leaves it, and
+/// each answer re-sends the frame on screen quantized to that depth; frames
+/// wait for the first one.
 async fn push(
-    mut stream: TcpStream,
+    stream: TcpStream,
     peer: SocketAddr,
-    mut frames: watch::Receiver<Arc<Frame>>,
-    mut tuning: watch::Receiver<Tuning>,
+    frames: watch::Receiver<Arc<Frame>>,
+    tuning: watch::Receiver<Tuning>,
 ) -> std::io::Result<()> {
     stream.set_nodelay(true)?;
     socket2::SockRef::from(&stream).set_tcp_notsent_lowat(UNSENT_LIMIT)?;
+    let (reader, stream) = stream.into_split();
+    let (depths, depth_reports) = watch::channel(None);
+    // Whichever side ends first ends the connection
+    tokio::select! {
+        result = read_reports(reader, &depths) => result,
+        result = send_updates(stream, peer, frames, tuning, depth_reports) => result,
+    }
+}
+
+async fn send_updates(
+    mut stream: OwnedWriteHalf,
+    peer: SocketAddr,
+    mut frames: watch::Receiver<Arc<Frame>>,
+    mut tuning: watch::Receiver<Tuning>,
+    mut depth_reports: watch::Receiver<Option<Depth>>,
+) -> std::io::Result<()> {
+    let mut depth: Option<Depth> = None;
     let mut current = *tuning.borrow_and_update();
     let mut correction = ColorCorrection::new(current.gamma, current.white_balance);
     stream
         .write_all(&Message::Brightness(current.brightness).encode())
         .await?;
-    frames.mark_changed();
     let mut window_start = Instant::now();
     let mut frames_sent = 0u32;
     loop {
         tokio::select! {
             biased;
+            changed = depth_reports.changed() => {
+                if changed.is_err() {
+                    return Ok(());
+                }
+                depth = *depth_reports.borrow_and_update();
+                frames.mark_changed();
+            }
             changed = tuning.changed() => {
                 if changed.is_err() {
                     return Ok(());
@@ -73,19 +99,19 @@ async fn push(
                 current = next;
                 if let Some(brightness) = change.brightness {
                     stream.write_all(&Message::Brightness(brightness).encode()).await?;
-                    frames.mark_changed();
                 }
                 if change.colour {
                     correction = ColorCorrection::new(current.gamma, current.white_balance);
                     frames.mark_changed();
                 }
             }
-            changed = frames.changed() => {
+            changed = frames.changed(), if depth.is_some() => {
                 if changed.is_err() {
                     return Ok(());
                 }
                 let frame = Arc::clone(&frames.borrow_and_update());
-                let panel = correction.apply(&frame);
+                let depth = depth.expect("frames wait for the panel's depth");
+                let panel = correction.apply(&frame, depth);
                 stream.write_all(&Message::Frame(panel).encode()).await?;
                 frames_sent += 1;
             }
@@ -96,6 +122,31 @@ async fn push(
             window_start = Instant::now();
             frames_sent = 0;
         }
+    }
+}
+
+/// Publishes each depth the panel reports, until it disconnects.
+///
+/// Cancel-safe only between reports, which is fine: it is dropped only
+/// when the connection ends.
+async fn read_reports(
+    mut reader: OwnedReadHalf,
+    depths: &watch::Sender<Option<Depth>>,
+) -> std::io::Result<()> {
+    loop {
+        let mut bytes = [0; REPORT_LEN];
+        match reader.read_exact(&mut bytes).await {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+            Err(e) => return Err(e),
+        }
+        let Report::Depth(depth) = Report::decode(bytes).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e:?}"))
+        })?;
+        info!("Device: panel shows {} bits per channel", depth.bits());
+        // Sent even when unchanged: every report follows a brightness the
+        // panel has applied, and the frame on screen needs re-sending
+        depths.send_replace(Some(depth));
     }
 }
 

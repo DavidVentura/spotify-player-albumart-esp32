@@ -25,6 +25,7 @@ pub static RECEIVED_BYTES: AtomicU32 = AtomicU32::new(0);
 enum LinkError {
     Connect(tcp::ConnectError),
     Read(tcp::Error),
+    Write(tcp::Error),
     Closed,
     Protocol(ProtocolError),
 }
@@ -73,5 +74,16 @@ async fn receive(
             }
             rest = &rest[progress.consumed..];
         }
+        if let Some(report) = panel.take_report() {
+            send(socket, &report.encode()).await?;
+        }
     }
+}
+
+async fn send(socket: &mut TcpSocket<'_>, mut bytes: &[u8]) -> Result<(), LinkError> {
+    while !bytes.is_empty() {
+        let written = socket.write(bytes).await.map_err(LinkError::Write)?;
+        bytes = &bytes[written..];
+    }
+    Ok(())
 }
