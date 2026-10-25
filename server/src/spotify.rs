@@ -1,6 +1,7 @@
 use std::time::{Duration, Instant};
 
 use reqwest::StatusCode;
+use reqwest::header::{HeaderMap, RETRY_AFTER};
 use serde::Deserialize;
 
 const TOKEN_URL: &str = "https://accounts.spotify.com/api/token";
@@ -74,6 +75,7 @@ impl NowPlaying {
 pub enum SpotifyError {
     Request(reqwest::Error),
     Unauthorized,
+    RateLimited { retry_after: Duration },
     Status(StatusCode),
     Json(serde_json::Error),
     UnexpectedImageUrl(String),
@@ -153,6 +155,7 @@ impl SpotifyClient {
             .bearer_auth(&token.0)
             .send()
             .await?;
+        check_rate_limit(response.status(), response.headers())?;
         let status = response.status();
         let body = response.bytes().await?;
         let now_playing = parse_now_playing(status, &body);
@@ -186,6 +189,7 @@ impl SpotifyClient {
             ])
             .send()
             .await?;
+        check_rate_limit(response.status(), response.headers())?;
         let status = response.status();
         let grant = parse_token_response(status, &response.bytes().await?)?;
         if let Some(rotated) = grant.rotated_refresh_token {
@@ -197,6 +201,22 @@ impl SpotifyClient {
         });
         Ok(grant.access_token)
     }
+}
+
+/// Spotify answers too many requests with how long to stay away; a 429
+/// without a usable `Retry-After` stays a plain status error.
+fn check_rate_limit(status: StatusCode, headers: &HeaderMap) -> Result<(), SpotifyError> {
+    if status != StatusCode::TOO_MANY_REQUESTS {
+        return Ok(());
+    }
+    let seconds = headers
+        .get(RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .ok_or(SpotifyError::Status(status))?;
+    Err(SpotifyError::RateLimited {
+        retry_after: Duration::from_secs(seconds),
+    })
 }
 
 fn parse_token_response(status: StatusCode, body: &[u8]) -> Result<TokenGrant, SpotifyError> {
@@ -316,6 +336,37 @@ mod tests {
                 .rotated_refresh_token,
             Some(RefreshToken::new("new".to_string()))
         );
+    }
+
+    fn headers(retry_after: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(RETRY_AFTER, retry_after.parse().unwrap());
+        headers
+    }
+
+    #[test]
+    fn rate_limit_reports_how_long_to_wait() {
+        assert!(matches!(
+            check_rate_limit(StatusCode::TOO_MANY_REQUESTS, &headers("30")),
+            Err(SpotifyError::RateLimited { retry_after }) if retry_after == Duration::from_secs(30)
+        ));
+    }
+
+    #[test]
+    fn rate_limit_without_a_delay_is_a_status_error() {
+        assert!(matches!(
+            check_rate_limit(StatusCode::TOO_MANY_REQUESTS, &HeaderMap::new()),
+            Err(SpotifyError::Status(StatusCode::TOO_MANY_REQUESTS))
+        ));
+        assert!(matches!(
+            check_rate_limit(StatusCode::TOO_MANY_REQUESTS, &headers("soon")),
+            Err(SpotifyError::Status(StatusCode::TOO_MANY_REQUESTS))
+        ));
+    }
+
+    #[test]
+    fn other_statuses_are_not_rate_limits() {
+        assert!(check_rate_limit(StatusCode::OK, &headers("30")).is_ok());
     }
 
     #[test]

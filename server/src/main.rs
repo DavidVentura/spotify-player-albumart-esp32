@@ -21,7 +21,7 @@ use crate::frame::Frame;
 use crate::playback::Source;
 use crate::spotify::{Artwork, NowPlaying, SpotifyClient, SpotifyError};
 
-const POLL_INTERVAL: Duration = Duration::from_secs(2);
+const POLL_INTERVAL: Duration = Duration::from_secs(5);
 // Spotify reports the next track only after the player has moved on to it
 const TRACK_END_MARGIN: Duration = Duration::from_millis(250);
 // Bounds the polling rate while Spotify still reports a track that should
@@ -68,17 +68,22 @@ async fn follow_spotify(mut spotify: SpotifyClient, covers: &watch::Sender<Arc<F
     let mut shown = Artwork::Nothing;
     loop {
         let polled_at = Instant::now();
-        let remaining = match update(&mut spotify, &shown, covers).await {
+        let delay = match update(&mut spotify, &shown, covers).await {
             Ok(now_playing) => {
                 shown = now_playing.artwork;
-                now_playing.remaining
+                poll_delay(now_playing.remaining)
+            }
+            // Polling on through a rate limit keeps extending it
+            Err(UpdateError::Spotify(SpotifyError::RateLimited { retry_after })) => {
+                warn!("Spotify: rate limited for {}s", retry_after.as_secs());
+                retry_after.max(POLL_INTERVAL)
             }
             Err(e) => {
                 warn!("Spotify: {e:?}");
-                None
+                POLL_INTERVAL
             }
         };
-        tokio::time::sleep_until(polled_at + poll_delay(remaining)).await;
+        tokio::time::sleep_until(polled_at + delay).await;
     }
 }
 
