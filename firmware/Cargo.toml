@@ -29,6 +29,8 @@ esp-println = { version = "0.18", features = ["esp32", "log-04"] }
 esp-radio = { version = "=1.0.0-beta.1", features = ["esp32", "wifi", "unstable", "log-04"] }
 esp-rtos = { version = "0.4", features = ["esp32", "embassy", "esp-radio", "log-04"] }
 log = "0.4"
+# Only for embassy-net's DHCP retry settings, which it does not re-export
+smoltcp = { version = "0.13", default-features = false, features = ["proto-dhcpv4"] }
 static_cell = "2"
 
 [patch.crates-io]
@@ -37,6 +39,9 @@ hub75-framebuffer = { path = "../vendor/hub75-framebuffer" }
 # Adds `ring-swap`: swaps buffers without stopping the DMA, because the
 # circular mode's stop and restart corrupts the first rows after every swap
 esp-hub75 = { path = "../vendor/esp-hub75" }
+# Polls the interface only after acting on a link change, because polling first
+# sent two DHCP DISCOVERs per link-up and cost every boot a 10s retry
+embassy-net = { path = "../vendor/embassy-net" }
 
 [profile.dev]
 # Rust debug builds are too slow for the radio and TLS stacks

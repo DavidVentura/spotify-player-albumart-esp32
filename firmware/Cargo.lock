@@ -442,8 +442,6 @@ dependencies = [
 [[package]]
 name = "embassy-net"
 version = "0.9.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "347bc855bdbdf50ed9c5a1d80e8204badb0ba149b8732dde38e1e9708ed9d313"
 dependencies = [
  "document-features",
  "embassy-net-driver",
@@ -1913,6 +1911,7 @@ dependencies = [
  "esp-radio",
  "esp-rtos",
  "log",
+ "smoltcp",
  "static_cell",
 ]
 

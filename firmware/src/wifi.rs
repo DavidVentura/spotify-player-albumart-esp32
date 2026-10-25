@@ -14,6 +14,11 @@ use crate::config::{WIFI_PASSWORD, WIFI_SSID};
 /// DHCP and the server connection.
 const SOCKETS: usize = 2;
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
+/// Replies to a weak station get lost now and then, and smoltcp's defaults
+/// (10s, 5s) make each loss a long stall. It must stay above the server's
+/// ping check (ISC dhcpd waits 1s before offering), or every retry would
+/// discard the offer to the previous one.
+const DHCP_RETRY: smoltcp::time::Duration = smoltcp::time::Duration::from_secs(2);
 /// In units of 0.25 dBm; ESP-IDF's default of 20 dBm.
 const MAX_TX_POWER: i8 = 80;
 
@@ -39,10 +44,13 @@ pub async fn connect(spawner: Spawner, wifi: WIFI<'static>, seed: u64) -> Stack<
         .set_max_tx_power(MAX_TX_POWER)
         .expect("TX power is within range");
 
+    let mut dhcp = embassy_net::DhcpConfig::default();
+    dhcp.retry_config.discover_timeout = DHCP_RETRY;
+    dhcp.retry_config.initial_request_timeout = DHCP_RETRY;
     static RESOURCES: StaticCell<StackResources<SOCKETS>> = StaticCell::new();
     let (stack, runner) = embassy_net::new(
         Interface::station(),
-        embassy_net::Config::dhcpv4(Default::default()),
+        embassy_net::Config::dhcpv4(dhcp),
         RESOURCES.init(StackResources::new()),
         seed,
     );
