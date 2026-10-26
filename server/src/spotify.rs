@@ -44,7 +44,7 @@ struct TokenGrant {
 pub struct ImageUrl(String);
 
 impl ImageUrl {
-    fn parse(url: &str) -> Result<Self, SpotifyError> {
+    pub fn parse(url: &str) -> Result<Self, SpotifyError> {
         if !url.starts_with(IMAGE_URL_PREFIX) {
             return Err(SpotifyError::UnexpectedImageUrl(url.to_string()));
         }
@@ -54,8 +54,20 @@ impl ImageUrl {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Artwork {
-    Nothing,
+    Nothing(Silence),
     Image(ImageUrl),
+}
+
+/// Why Spotify has no cover to show.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Silence {
+    /// No player is active: Spotify answered without a body.
+    NoPlayer,
+    Paused,
+    /// Something plays that Spotify does not describe, such as an ad.
+    NoItem,
+    /// The item has no art, such as a local file.
+    NoImages,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -66,10 +78,12 @@ pub struct NowPlaying {
 }
 
 impl NowPlaying {
-    const NOTHING: NowPlaying = NowPlaying {
-        artwork: Artwork::Nothing,
-        remaining: None,
-    };
+    fn silent(silence: Silence) -> Self {
+        NowPlaying {
+            artwork: Artwork::Nothing(silence),
+            remaining: None,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -238,17 +252,17 @@ fn parse_token_response(status: StatusCode, body: &[u8]) -> Result<TokenGrant, S
 
 fn parse_now_playing(status: StatusCode, body: &[u8]) -> Result<NowPlaying, SpotifyError> {
     match status {
-        StatusCode::NO_CONTENT => return Ok(NowPlaying::NOTHING),
+        StatusCode::NO_CONTENT => return Ok(NowPlaying::silent(Silence::NoPlayer)),
         StatusCode::UNAUTHORIZED => return Err(SpotifyError::Unauthorized),
         StatusCode::OK => {}
         status => return Err(SpotifyError::Status(status)),
     }
     let playing: CurrentlyPlaying = serde_json::from_slice(body).map_err(SpotifyError::Json)?;
     if !playing.is_playing {
-        return Ok(NowPlaying::NOTHING);
+        return Ok(NowPlaying::silent(Silence::Paused));
     }
     let (images, duration_ms) = match playing.item {
-        None => return Ok(NowPlaying::NOTHING),
+        None => return Ok(NowPlaying::silent(Silence::NoItem)),
         Some(Item::Track { album, duration_ms }) => (album.images, duration_ms),
         Some(Item::Episode {
             images,
@@ -261,7 +275,7 @@ fn parse_now_playing(status: StatusCode, body: &[u8]) -> Result<NowPlaying, Spot
     // The largest cover downsamples into the cleanest 64x64; local files have
     // no images at all
     let artwork = match images.iter().max_by_key(|image| image.width) {
-        None => Artwork::Nothing,
+        None => Artwork::Nothing(Silence::NoImages),
         Some(largest) => Artwork::Image(ImageUrl::parse(&largest.url)?),
     };
     Ok(NowPlaying { artwork, remaining })
@@ -403,7 +417,7 @@ mod tests {
         assert_eq!(
             now_playing(&track(true, "[]")).unwrap(),
             NowPlaying {
-                artwork: Artwork::Nothing,
+                artwork: Artwork::Nothing(Silence::NoImages),
                 remaining: Some(Duration::from_millis(200_000 - 1234)),
             }
         );
@@ -413,7 +427,7 @@ mod tests {
     fn paused_track_shows_nothing() {
         assert_eq!(
             now_playing(&track(false, ALBUM_IMAGES)).unwrap(),
-            NowPlaying::NOTHING
+            NowPlaying::silent(Silence::Paused)
         );
     }
 
@@ -445,14 +459,17 @@ mod tests {
     #[test]
     fn ad_without_item_shows_nothing() {
         let body = r#"{"is_playing": true, "currently_playing_type": "ad", "item": null}"#;
-        assert_eq!(now_playing(body).unwrap(), NowPlaying::NOTHING);
+        assert_eq!(
+            now_playing(body).unwrap(),
+            NowPlaying::silent(Silence::NoItem)
+        );
     }
 
     #[test]
     fn no_content_shows_nothing() {
         assert_eq!(
             parse_now_playing(StatusCode::NO_CONTENT, b"").unwrap(),
-            NowPlaying::NOTHING
+            NowPlaying::silent(Silence::NoPlayer)
         );
     }
 
