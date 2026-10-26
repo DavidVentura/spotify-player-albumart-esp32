@@ -10,6 +10,8 @@ const TOKEN_URL: &str = "https://accounts.spotify.com/api/token";
 const NOW_PLAYING_URL: &str = "https://api.spotify.com/v1/me/player/currently-playing?market=from_token&additional_types=track,episode";
 const IMAGE_URL_PREFIX: &str = "https://i.scdn.co/";
 const TOKEN_EXPIRY_MARGIN: Duration = Duration::from_secs(60);
+// Without a deadline, a request Spotify never answers stalls polling for good
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClientCredentials {
@@ -140,7 +142,10 @@ pub struct SpotifyClient {
 impl SpotifyClient {
     pub fn new(credentials: ClientCredentials, refresh_token: RefreshToken) -> Self {
         SpotifyClient {
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .timeout(REQUEST_TIMEOUT)
+                .build()
+                .expect("the TLS backend initialises"),
             credentials,
             refresh_token,
             access: None,
