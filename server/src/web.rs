@@ -136,7 +136,10 @@ async fn frame_stream(State(state): State<AppState>) -> Response {
     let frames = stream::unfold(output, |mut output| async move {
         output.changed().await.ok()?;
         let frame = Arc::clone(&output.borrow_and_update());
-        Some((Ok::<_, Infallible>(stream_part(&encode_png(&frame))), output))
+        Some((
+            Ok::<_, Infallible>(stream_part(&encode_png(&frame))),
+            output,
+        ))
     });
     let opening = stream::once(async { Ok(Bytes::from(format!("--{STREAM_BOUNDARY}\r\n"))) });
     (

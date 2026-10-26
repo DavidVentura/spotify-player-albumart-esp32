@@ -140,9 +140,8 @@ async fn read_reports(
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
             Err(e) => return Err(e),
         }
-        let Report::Depth(depth) = Report::decode(bytes).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e:?}"))
-        })?;
+        let Report::Depth(depth) = Report::decode(bytes)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e:?}")))?;
         info!("Device: panel shows {} bits per channel", depth.bits());
         // Sent even when unchanged: every report follows a brightness the
         // panel has applied, and the frame on screen needs re-sending
